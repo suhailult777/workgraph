@@ -1,0 +1,17 @@
+WorkGraph
+Copyright 2026 Mohd Suhail Idrisi
+
+This product includes software developed by third parties:
+
+- Agentic Web runtime and agentify-website skill, Cognizant AI Labs
+  https://github.com/cognizant-ai-labs/agentic-web
+  Apache-2.0. The runtime under public/runtime/ is copied unchanged.
+
+- Relate, RelatedB
+  https://github.com/relatedb/relate
+  Apache-2.0. Used as an embedded Python library and a persistent graph store.
+
+WorkGraph reuses ideas from the author's earlier MilestonePay project
+(milestone and sample-payment UX). No MilestonePay source files or git history
+were copied into this repository. Any later copied snippet must be disclosed
+here and in the submission write-up.

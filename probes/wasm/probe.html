@@ -1,0 +1,32 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Relate WASM probe</title>
+<body>
+<h1>Relate WASM probe</h1>
+<pre id="log"></pre>
+<script type="module">
+import init, { RelateDb } from "./node_modules/@relate/relate-wasm/relate.js";
+
+const log = (m) => {
+  document.getElementById("log").textContent += m + "\n";
+};
+
+window.runInMemory = async () => {
+  await init();
+  const db = new RelateDb();
+  const run = (q, p = null) => JSON.parse(db.execute(q, p ? JSON.stringify(p) : null));
+  run("CREATE (:A {id: 1})-[:NEXT]->(:B {id: 2})-[:NEXT]->(:C {id: 3})");
+  const rows = run("MATCH (a:A)-[:NEXT*2]->(c:C) RETURN a.id AS f, c.id AS t");
+  const engine = JSON.parse(db.execute("RETURN 1 AS engine", null));
+  db.free();
+  return { rows: rows.rows, engine: engine.rows, wasm: typeof WebAssembly };
+};
+
+window.runOpfs = (cmd) => new Promise((resolve, reject) => {
+  const w = new Worker("./worker.js", { type: "module" });
+  w.onmessage = (e) => { resolve(e.data); w.terminate(); };
+  w.onerror = (e) => reject(new Error(e.message || "worker error"));
+  w.postMessage({ cmd });
+});
+</script>
+</body>

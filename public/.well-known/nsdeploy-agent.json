@@ -1,0 +1,7 @@
+{
+  "protocol": "nsdeploy-agent-mcp/v1",
+  "network": "workgraph",
+  "front_man": "workgraph_coordinator",
+  "available": false,
+  "reason": "This is a static bundle; a public MCP facade requires an application host."
+}

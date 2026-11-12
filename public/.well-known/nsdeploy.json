@@ -1,0 +1,18 @@
+{
+  "protocol": "nsdeploy-link/v1",
+  "exports": [
+    {
+      "network": "workgraph",
+      "front_man": "workgraph_coordinator",
+      "aliases": [
+        "workgraph",
+        "workgraph_coordinator"
+      ],
+      "url": "workgraph"
+    }
+  ],
+  "imports": [],
+  "link_updates": {
+    "mode": "browser-local"
+  }
+}

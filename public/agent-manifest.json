@@ -1,0 +1,77 @@
+{
+  "brand": "WorkGraph Assistant",
+  "networks": [
+    {
+      "name": "workgraph",
+      "front_man": "workgraph_coordinator",
+      "hocon": "./workgraph.network.json",
+      "description": "Read sample projects, milestone dependencies, invoices and payments, and find paid work by skill.",
+      "tags": [
+        "agentified-website",
+        "relate-hackathon"
+      ],
+      "sample_queries": [
+        "Which milestones are blocked by an unpaid invoice?",
+        "Who has been paid for design-system work before?",
+        "Show the projects and their milestone status.",
+        "Record a real card payment for the design system."
+      ]
+    }
+  ],
+  "llm_router": {
+    "base_url": "https://api.openai.com/v1",
+    "mock": false,
+    "byok_router": "https://api.openai.com/v1"
+  },
+  "allowed_peers": [],
+  "peer_policy": {
+    "mode": "closed",
+    "deny_origins": [],
+    "note": "Phase 0: local agents and page-local actions only."
+  },
+  "agent_mcp": {
+    "protocol": "nsdeploy-agent-mcp/v1",
+    "network": "workgraph",
+    "front_man": "workgraph_coordinator",
+    "available": false,
+    "reason": "This is a static bundle; a public MCP facade requires an application host."
+  },
+  "theme": {
+    "primary": "#245c4f"
+  },
+  "linking": {
+    "protocol": "nsdeploy-link/v1",
+    "exports": [
+      {
+        "network": "workgraph",
+        "front_man": "workgraph_coordinator",
+        "aliases": [
+          "workgraph",
+          "workgraph_coordinator"
+        ],
+        "url": "workgraph"
+      }
+    ],
+    "imports": [],
+    "link_updates": {
+      "mode": "browser-local"
+    }
+  },
+  "deployment": {
+    "mode": "static",
+    "self_contained_runtime": true,
+    "browser_mock": false,
+    "direct_byok": true,
+    "direct_mcp_requires_cors": true,
+    "public_mcp_facade": false
+  },
+  "actions": {
+    "version": 1,
+    "module": "./site-actions.js",
+    "agentTools": [
+      "get_graph_state",
+      "get_blocked_milestones",
+      "search_similar_work"
+    ]
+  }
+}

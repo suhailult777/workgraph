@@ -9,3 +9,10 @@ vendor/
 .env.*
 *.log
 data/*.lock
+
+probes/wasm/node_modules/
+probes/wasm/.profile/
+probes/wasm/probe.png
+
+*.tsbuildinfo
+

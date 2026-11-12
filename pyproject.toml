@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["vendor", ".venv", "frontend", "node_modules"]
+
+[tool.ruff]
+line-length = 100

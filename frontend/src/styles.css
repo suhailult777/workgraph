@@ -1,0 +1,247 @@
+:root {
+  --ink: #17211d;
+  --muted: #5d6a63;
+  --paper: #f5f3ed;
+  --card: #fffdf8;
+  --line: #d9d5c9;
+  --green: #245c4f;
+  --green-soft: #dfe9e3;
+  --amber: #8a5a1c;
+  --red: #8c3a2f;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  color: var(--ink);
+  background: var(--paper);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+main {
+  max-width: 1040px;
+  margin: 0 auto;
+  padding: 56px 24px 40px;
+}
+
+.masthead {
+  border-bottom: 2px solid var(--ink);
+  padding-bottom: 24px;
+}
+
+.eyebrow {
+  margin: 0 0 10px;
+  font-size: 12px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--green);
+  font-weight: 700;
+}
+
+h1 {
+  margin: 0;
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: clamp(44px, 8vw, 76px);
+  line-height: 0.95;
+  letter-spacing: -0.03em;
+}
+
+.lede {
+  max-width: 58ch;
+  margin: 14px 0 0;
+  font-size: 18px;
+  line-height: 1.55;
+  color: var(--muted);
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-top: 24px;
+}
+
+.card,
+.panel {
+  background: var(--card);
+  border: 1px solid var(--line);
+  padding: 20px;
+}
+
+h2 {
+  margin: 0 0 12px;
+  font-size: 13px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+h3 {
+  margin: 0;
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 24px;
+}
+
+.big {
+  margin: 0;
+  font-size: 32px;
+  font-weight: 700;
+  color: var(--green);
+  text-transform: capitalize;
+}
+
+.muted {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.path {
+  margin: 10px 0 0;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.chips li {
+  border: 1px solid var(--line);
+  background: var(--paper);
+  padding: 6px 10px;
+  font-size: 13px;
+}
+
+.chips strong {
+  color: var(--green);
+}
+
+.panel {
+  margin-top: 16px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 15px;
+}
+
+th,
+td {
+  text-align: left;
+  padding: 10px 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+th {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+code {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 13px;
+}
+
+.projects {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+.projects article {
+  border-top: 3px solid var(--green);
+  background: var(--paper);
+  padding: 16px;
+}
+
+.status {
+  margin: 4px 0 12px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+.projects ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.projects li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+  font-size: 14px;
+}
+
+.dot {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+}
+
+.dot.paid {
+  color: var(--green);
+}
+
+.dot.sent {
+  color: var(--amber);
+}
+
+.dot.blocked {
+  color: var(--red);
+}
+
+.error {
+  margin-top: 20px;
+  border: 1px solid var(--red);
+  background: #f7e7e3;
+  color: var(--red);
+  padding: 12px;
+}
+
+footer {
+  margin-top: 32px;
+  border-top: 1px solid var(--line);
+  padding-top: 16px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+footer a {
+  color: var(--green);
+}
+
+@media (max-width: 700px) {
+  main {
+    padding: 32px 16px;
+  }
+
+  .grid,
+  .projects {
+    grid-template-columns: 1fr;
+  }
+}

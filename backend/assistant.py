@@ -15,9 +15,9 @@ from typing import Any, Callable
 import httpx
 
 DEFAULT_FREE_MODELS = (
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "google/gemini-2.0-flash-exp:free",
-    "mistralai/mistral-small-3.1-24b-instruct:free",
+    "google/gemma-4-31b-it:free",
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "google/gemma-4-26b-a4b-it:free",
 )
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 

@@ -1,0 +1,9 @@
+{
+  "name": "workgraph",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:agent": "node --test \"tests_agent/*.test.mjs\"",
+    "check:network": "node vendor/agentic-web/skills/agentify-website/scripts/build_network.mjs public/workgraph.hocon --manifest public/agent-manifest.json --check"
+  }
+}

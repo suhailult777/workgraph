@@ -5,7 +5,7 @@
       "name": "workgraph",
       "front_man": "workgraph_coordinator",
       "hocon": "./workgraph.network.json",
-      "description": "Read sample projects, milestone dependencies, invoices and payments, and find paid work by skill.",
+      "description": "Ask the sample graph which milestones are blocked, find paid work by skill, and draft a plan without writing to the graph.",
       "tags": [
         "agentified-website",
         "relate-hackathon"
@@ -14,20 +14,21 @@
         "Which milestones are blocked by an unpaid invoice?",
         "Who has been paid for design-system work before?",
         "Show the projects and their milestone status.",
+        "Draft a four-step plan for a new brand project.",
         "Record a real card payment for the design system."
       ]
     }
   ],
   "llm_router": {
-    "base_url": "https://api.openai.com/v1",
-    "mock": false,
-    "byok_router": "https://api.openai.com/v1"
+    "base_url": "/api/demo/llm",
+    "mock": true,
+    "byok_router": "https://openrouter.ai/api/v1"
   },
   "allowed_peers": [],
   "peer_policy": {
     "mode": "closed",
     "deny_origins": [],
-    "note": "Phase 0: local agents and page-local actions only."
+    "note": "Phase 1 milestone 2: browser reads and a local draft only."
   },
   "agent_mcp": {
     "protocol": "nsdeploy-agent-mcp/v1",
@@ -60,7 +61,7 @@
   "deployment": {
     "mode": "static",
     "self_contained_runtime": true,
-    "browser_mock": false,
+    "browser_mock": true,
     "direct_byok": true,
     "direct_mcp_requires_cors": true,
     "public_mcp_facade": false
@@ -70,8 +71,9 @@
     "module": "./site-actions.js",
     "agentTools": [
       "get_graph_state",
-      "get_blocked_milestones",
-      "search_similar_work"
+      "search_similar_work",
+      "propose_plan",
+      "fill_draft"
     ]
   }
 }

@@ -11,6 +11,7 @@ import {
 import { Board } from "./components/Board";
 import { PaymentDialog } from "./components/PaymentDialog";
 import { ProjectView } from "./components/ProjectView";
+import { AssistantPanel } from "./components/AssistantPanel";
 import type {
   Health,
   Milestone,
@@ -204,6 +205,16 @@ export default function App() {
           <span>WorkGraph</span>
         </a>
         <div className="topbar-right">
+          <button
+            className="topbar-ask"
+            type="button"
+            aria-label="Ask the graph assistant"
+            onClick={() =>
+              document.getElementById("assistant")?.scrollIntoView({ behavior: "smooth", block: "start" })
+            }
+          >
+            Ask
+          </button>
           <span className={`live-dot${health?.graph_ready ? " is-ready" : ""}`} aria-hidden="true" />
           <span className="topbar-status">{healthLabel}</span>
           <span className="topbar-divider" aria-hidden="true" />
@@ -239,10 +250,12 @@ export default function App() {
         )}
       </main>
 
+      <AssistantPanel />
+
       <footer className="site-footer">
         <p>
-          Sample data only. No cards, no live PayPal, no live model call. Amounts are integer
-          cents.
+          Sample data only. No cards, no live PayPal, no real money. No live model call unless
+          you add your own key. Amounts are integer cents.
         </p>
         <nav aria-label="Agent artifacts">
           <a href="/agent-manifest.json">agent manifest</a>

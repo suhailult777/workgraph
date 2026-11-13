@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections import deque
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -60,65 +61,117 @@ def _invoice_status(conn, milestone_id: str) -> str | None:
     return rows[0]["status"] if rows else None
 
 
-def _ancestor_paths(parents: dict[str, list[str]], start: str) -> list[list[str]]:
-    """Every path from a milestone to a root predecessor, nearest first."""
-    paths: list[list[str]] = []
-    stack: list[tuple[str, list[str]]] = [(start, [start])]
-    while stack:
-        node, path = stack.pop()
-        node_parents = parents.get(node, [])
-        if not node_parents:
-            paths.append(path)
-            continue
-        for parent in node_parents:
-            if parent in path:  # defensive: a cycle must not hang the API
-                paths.append(path)
-                continue
-            stack.append((parent, path + [parent]))
-    return paths
-
-
 def _blocked_by(
     milestone: dict,
-    paths: list[list[str]],
+    parents: dict[str, list[str]],
     by_id: dict[str, dict],
 ) -> list[dict]:
-    blockers: list[dict] = []
-    seen: set[tuple] = set()
-    for path in paths:
-        ancestors = path[1:]
-        if not ancestors:
-            continue
-        cause = None
-        for index, node_id in enumerate(ancestors, start=1):
-            invoice = by_id[node_id]["invoice"]
+    """Find blockers with one bounded BFS, not every root path.
+
+    The walk visits each ancestor once, so a wide DAG cannot explode. An unpaid
+    invoice is recorded with the shortest path to it. A not-done ancestor is
+    recorded only when it is not already on an invoice path and no nearer
+    not-done ancestor was chosen, which keeps the human UI's nearest-cause path.
+    """
+    start = milestone["id"]
+    queue: deque[tuple[str, list[str]]] = deque([(start, [start])])
+    visited = {start}
+    invoice_paths: list[tuple[list[str], dict]] = []
+    not_done_paths: list[list[str]] = []
+
+    while queue:
+        node, path = queue.popleft()
+        for parent in parents.get(node, []):
+            if parent in visited:
+                continue
+            visited.add(parent)
+            parent_path = path + [parent]
+            info = by_id.get(parent)
+            if info is None:
+                continue
+            invoice = info["invoice"]
             if invoice and invoice["status"] == "SENT":
-                cause = {
-                    "path": [by_id[n]["name"] for n in path[: index + 1]],
-                    "reason": "unpaid_invoice",
-                    "invoice": invoice["number"],
-                    "amount_cents": invoice["amount_cents"],
-                }
-                break
-        if cause is None:
-            for index, node_id in enumerate(ancestors, start=1):
-                if by_id[node_id]["status"] != "DONE":
-                    cause = {
-                        "path": [by_id[n]["name"] for n in path[: index + 1]],
-                        "reason": "not_done",
-                        "invoice": None,
-                        "amount_cents": None,
-                    }
-                    break
-        if cause is None:
+                invoice_paths.append((parent_path, invoice))
+                continue
+            if info["status"] != "DONE":
+                not_done_paths.append(parent_path)
+            queue.append((parent, parent_path))
+
+    invoice_nodes = {path[-1] for path, _ in invoice_paths}
+    invoice_ancestors: set[str] = set()
+    for path, _ in invoice_paths:
+        invoice_ancestors.update(path[1:-1])
+
+    blockers: list[dict] = []
+    for path, invoice in invoice_paths:
+        blockers.append(
+            {
+                "path": [by_id[node]["name"] for node in path],
+                "reason": "unpaid_invoice",
+                "invoice": invoice["number"],
+                "amount_cents": invoice["amount_cents"],
+            }
+        )
+
+    selected_not_done: set[str] = set()
+    for path in sorted(not_done_paths, key=len):
+        node = path[-1]
+        if node in invoice_nodes or node in invoice_ancestors:
             continue
-        key = (tuple(cause["path"]), cause["reason"], cause["invoice"])
+        if any(selected in path for selected in selected_not_done):
+            continue
+        selected_not_done.add(node)
+        blockers.append(
+            {
+                "path": [by_id[item]["name"] for item in path],
+                "reason": "not_done",
+                "invoice": None,
+                "amount_cents": None,
+            }
+        )
+
+    seen: set[tuple] = set()
+    unique: list[dict] = []
+    for blocker in blockers:
+        key = (tuple(blocker["path"]), blocker["reason"], blocker["invoice"])
         if key in seen:
             continue
         seen.add(key)
-        blockers.append(cause)
-    blockers.sort(key=lambda item: (len(item["path"]), item["path"]))
-    return blockers
+        unique.append(blocker)
+    unique.sort(
+        key=lambda item: (
+            0 if item["reason"] == "unpaid_invoice" else 1,
+            len(item["path"]),
+            item["path"],
+        )
+    )
+    return unique[:12]
+
+
+def assert_store_integrity(conn) -> None:
+    """Refuse the one-to-one invoice rules everywhere a raw read is served."""
+    for row in _fetch(
+        conn,
+        "MATCH (m:Milestone)-[:INVOICED]->(i:Invoice) "
+        "RETURN m.id AS id, m.name AS name, count(i) AS invoice_count",
+    ):
+        if row["invoice_count"] > 1:
+            raise GraphError(
+                "multiple_invoices",
+                f"{row['name']} has {row['invoice_count']} invoices; "
+                "exactly one invoice per milestone is allowed.",
+            )
+    for row in _fetch(
+        conn,
+        "MATCH (i:Invoice)<-[:INVOICED]-(m:Milestone) "
+        "RETURN i.id AS id, i.number AS number, count(m) AS milestone_count",
+    ):
+        if row["milestone_count"] > 1:
+            raise GraphError(
+                "ambiguous_invoice",
+                f"Invoice {row['number']} is linked to {row['milestone_count']} milestones; "
+                "exactly one is allowed.",
+            )
 
 
 def _recalc_statuses(conn, project_id: str) -> None:
@@ -193,6 +246,7 @@ def _load_project(conn, project_id: str) -> dict:
     if not projects:
         raise GraphError("not_found", f"Project {project_id} was not found.", 404)
     project = projects[0]
+    assert_store_integrity(conn)
 
     parties = _fetch(
         conn,
@@ -355,12 +409,11 @@ def _load_project(conn, project_id: str) -> dict:
     milestones: list[dict] = []
     for row in milestone_rows:
         milestone = by_id[row["id"]]
-        paths = _ancestor_paths(parents, row["id"])
         milestone["parents"] = [
             {"id": pid, "name": by_id[pid]["name"]} for pid in parents.get(row["id"], [])
         ]
         milestone["blocked_by"] = (
-            [] if milestone["status"] == "DONE" else _blocked_by(milestone, paths, by_id)
+            [] if milestone["status"] == "DONE" else _blocked_by(milestone, parents, by_id)
         )
         milestone["blocked"] = bool(milestone["blocked_by"])
         invoice = milestone["invoice"]
@@ -586,6 +639,72 @@ def list_projects(conn) -> list[dict]:
     return projects
 
 
+def agent_state(conn) -> dict:
+    """Return the compact, grounded state the browser assistant reads.
+
+    The human UI uses the richer project detail; this keeps names, statuses,
+    invoice numbers, blocked paths and amounts without graph layout data.
+    """
+    rows = _fetch(
+        conn,
+        "MATCH (p:Project) RETURN p.id AS id, p.name AS name, p.status AS status ORDER BY p.name",
+    )
+    rows.sort(key=lambda row: (0 if row["status"] == "active" else 1, row["name"]))
+    projects = []
+    for row in rows:
+        detail = get_project(conn, row["id"])
+        projects.append(
+            {
+                "id": detail["project"]["id"],
+                "name": detail["project"]["name"],
+                "status": detail["project"]["status"],
+                "client": detail["project"]["client"],
+                "owner": detail["project"]["owner"],
+                "stats": detail["stats"],
+                "next": detail["next"],
+                "milestones": [
+                    {
+                        "id": milestone["id"],
+                        "name": milestone["name"],
+                        "status": milestone["status"],
+                        "amount_cents": milestone["amount_cents"],
+                        "invoice": milestone["invoice"],
+                        "parents": [parent["name"] for parent in milestone["parents"]],
+                        "blocked_by": milestone["blocked_by"],
+                        "can_complete": milestone["can_complete"],
+                        "can_pay": milestone["can_pay"],
+                        "deliverables": [
+                            {"name": deliverable["name"], "unlocked": deliverable["unlocked"]}
+                            for deliverable in milestone["deliverables"]
+                        ],
+                    }
+                    for milestone in detail["milestones"]
+                ],
+                "invoices": detail["invoices"],
+                "payments": detail["payments"],
+            }
+        )
+    skills = [
+        skill["name"]
+        for skill in _fetch(
+            conn,
+            "MATCH (s:Skill) RETURN s.name AS name ORDER BY s.name",
+        )
+    ]
+    counts = _fetch(
+        conn,
+        "MATCH (n) WITH labels(n) AS labels UNWIND labels AS label "
+        "RETURN label, count(*) AS count ORDER BY label",
+    )
+    return {
+        "mode": "sample",
+        "note": "Sample data only. Amounts are integer cents. No real money, live PayPal or email.",
+        "projects": projects,
+        "skills": skills,
+        "node_counts": counts,
+    }
+
+
 def _invoice_row(conn, invoice_id: str) -> dict:
     rows = _fetch(
         conn,
@@ -598,7 +717,26 @@ def _invoice_row(conn, invoice_id: str) -> dict:
     )
     if not rows:
         raise GraphError("not_found", f"Invoice {invoice_id} was not found.", 404)
-    return rows[0]
+    if len(rows) > 1:
+        raise GraphError(
+            "ambiguous_invoice",
+            f"Invoice {invoice_id} is linked to {len(rows)} milestones; "
+            "exactly one is allowed.",
+        )
+    row = rows[0]
+    invoice_count = _fetch(
+        conn,
+        "MATCH (m:Milestone {id: $id})-[:INVOICED]->(i:Invoice) "
+        "RETURN count(i) AS invoice_count",
+        {"id": row["milestone_id"]},
+    )[0]["invoice_count"]
+    if invoice_count > 1:
+        raise GraphError(
+            "multiple_invoices",
+            f"{row['milestone_name']} has {invoice_count} invoices; "
+            "exactly one invoice per milestone is allowed.",
+        )
+    return row
 
 
 def _deliverable_rows(conn, milestone_id: str) -> list[dict]:
@@ -612,6 +750,7 @@ def _deliverable_rows(conn, milestone_id: str) -> list[dict]:
 
 
 def preview_payment(conn, invoice_id: str) -> dict:
+    assert_store_integrity(conn)
     row = _invoice_row(conn, invoice_id)
     if row["status"] == "PAID":
         raise GraphError("already_paid", f"Invoice {row['number']} is already paid.")
@@ -809,6 +948,7 @@ def _unique_project_name(conn, requested: str) -> str:
 
 
 def create_sample_project(conn, name: str | None = None) -> dict:
+    assert_store_integrity(conn)
     project_name = _unique_project_name(conn, name or "Juniper launch")
     suffix = uuid.uuid4().hex[:10]
     project_id = f"proj-{suffix}"

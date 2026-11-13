@@ -11,10 +11,12 @@ ORDER BY blocked
 """
 
 PAID_SKILL_HISTORY = """
-MATCH (skill:Skill {name: $skill})<-[:NEEDS_SKILL]-(project:Project)<-[:WORKED_ON]-(party:Party),
-      (project)-[:HAS_MILESTONE]->(m:Milestone)-[:INVOICED]->(inv:Invoice)-[:PAID_BY]->(pay:Payment)
+MATCH (skill:Skill {name: $skill})<-[:NEEDS_SKILL]-(project:Project)
+      <-[:WORKED_ON]-(party:Party)-[:HAS_SKILL]->(skill),
+      (project)-[:HAS_MILESTONE]->(m:Milestone)-[:INVOICED]->(inv:Invoice)
+      -[:PAID_BY]->(pay:Payment)
 RETURN DISTINCT party.name AS party, project.name AS project,
-       m.name AS milestone, pay.amount_cents AS amount_cents
+       m.name AS milestone, inv.number AS invoice, pay.amount_cents AS amount_cents
 ORDER BY party, milestone
 """
 

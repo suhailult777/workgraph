@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -77,6 +78,28 @@ def test_blocked(client):
         {"blocked": "Build", "waiting_on": "Design system", "invoice": "WG-1002", "amount_cents": 240000},
         {"blocked": "Handover", "waiting_on": "Design system", "invoice": "WG-1002", "amount_cents": 240000},
     ]
+
+
+def test_graph_state_for_the_assistant(client):
+    body = client.get("/api/graph/state").json()
+    assert body["mode"] == "sample"
+    assert body["skills"] == ["Design systems", "Front-end build", "User research"]
+    projects = {project["name"]: project for project in body["projects"]}
+    assert set(projects) == {"Harbour rebrand", "Atlas dashboard"}
+
+    harbour = projects["Harbour rebrand"]
+    assert harbour["stats"]["blocked"] == 2
+    build = next(m for m in harbour["milestones"] if m["name"] == "Build")
+    assert build["blocked_by"] == [
+        {
+            "path": ["Build", "Design system"],
+            "reason": "unpaid_invoice",
+            "invoice": "WG-1002",
+            "amount_cents": 240000,
+        }
+    ]
+    assert build["can_pay"] is False
+    assert "graph" not in harbour
 
 
 def test_similar(client):
@@ -198,9 +221,11 @@ def test_manifest(client):
     assert manifest["networks"][0]["front_man"] == "workgraph_coordinator"
     assert manifest["actions"]["agentTools"] == [
         "get_graph_state",
-        "get_blocked_milestones",
         "search_similar_work",
+        "propose_plan",
+        "fill_draft",
     ]
+    assert manifest["llm_router"]["mock"] is True
 
 
 def test_network_is_resolved_json(client):
@@ -208,8 +233,9 @@ def test_network_is_resolved_json(client):
     assert response.status_code == 200
     network = response.json()
     names = {tool["name"] for tool in network["tools"]}
-    assert names == {"workgraph_coordinator", "ledger_specialist"}
-    assert network["tools"][0]["tools"] == ["ledger_specialist"]
+    assert names == {"workgraph_coordinator", "plan_specialist", "ledger_specialist"}
+    coordinator = next(tool for tool in network["tools"] if tool["name"] == "workgraph_coordinator")
+    assert coordinator["tools"] == ["plan_specialist", "ledger_specialist"]
     text = response.text
     assert '"include"' not in text and '"includes"' not in text
     assert "$" not in text  # no environment substitutions
@@ -222,15 +248,118 @@ def test_links(client):
 
 def test_runtime_files(client):
     assert client.get("/runtime/index.js").status_code == 200
+    assert client.get("/runtime/generated/graph.gen.mjs").status_code == 200
     assert client.get("/runtime/README.md").status_code == 200
     assert client.get("/runtime/LICENSE.txt").status_code == 200
     assert client.get("/.well-known/nsdeploy.json").status_code == 200
     assert client.get("/agent-mcp.json").status_code == 200
 
 
+def test_site_action_modules_are_served_as_javascript(client):
+    for path in ("/site-actions.js", "/page-bridge.js"):
+        response = client.get(path)
+        assert response.status_code == 200, path
+        assert response.headers["content-type"].startswith("application/javascript"), path
+    assert client.get("/runtime/generated/graph.gen.mjs").headers["content-type"].startswith(
+        "application/javascript"
+    )
+
+
 def test_cors_on_public_artifacts(client):
     response = client.get("/agent-manifest.json", headers={"Origin": "https://peer.example"})
     assert response.headers["access-control-allow-origin"] == "*"
+
+
+def test_cors_does_not_grant_cross_origin_writes(client):
+    response = client.post(
+        "/api/projects",
+        json={"name": "CORS test"},
+        headers={"Origin": "https://evil.example"},
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "cross_origin_write"
+    assert "access-control-allow-origin" not in response.headers
+
+
+def test_same_origin_write_is_allowed(client):
+    response = client.post(
+        "/api/projects",
+        json={"name": "Same origin"},
+        headers={"Origin": "http://testserver"},
+    )
+    assert response.status_code == 201
+    assert response.json()["project"]["name"] == "Same origin"
+
+
+def test_write_requires_a_local_host_even_with_a_matching_origin(client):
+    response = client.post(
+        "/api/projects",
+        json={"name": "DNS rebinding"},
+        headers={"Host": "evil.example", "Origin": "http://evil.example"},
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "host_not_allowed"
+
+    response = client.post(
+        "/api/projects",
+        json={"name": "No origin"},
+        headers={"Host": "evil.example"},
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "host_not_allowed"
+
+
+def test_demo_router_returns_an_sse_tool_call(client):
+    response = client.post(
+        "/api/demo/llm/chat/completions",
+        json={
+            "model": "workgraph-demo",
+            "messages": [
+                {"role": "user", "content": "Which milestones are blocked by an unpaid invoice?"}
+            ],
+            "tools": [
+                {"type": "function", "function": {"name": "website_get_graph_state"}},
+                {"type": "function", "function": {"name": "website_search_similar_work"}},
+            ],
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert "data: [DONE]" in response.text
+    events = [
+        json.loads(line[5:].strip())
+        for line in response.text.splitlines()
+        if line.startswith("data:") and line[5:].strip() not in ("", "[DONE]")
+    ]
+    calls = [
+        call
+        for event in events
+        for choice in event.get("choices", [])
+        for call in choice.get("delta", {}).get("tool_calls", [])
+    ]
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "website_get_graph_state"
+    assert json.loads(calls[0]["function"]["arguments"]) == {}
+    assert events[-1]["choices"][0]["finish_reason"] == "tool_calls"
+    assert response.headers["x-nsdeploy-llm-route"] == "demo"
+
+
+def test_demo_router_refuses_a_card_charge(client):
+    response = client.post(
+        "/api/demo/llm/chat/completions",
+        json={
+            "model": "workgraph-demo",
+            "messages": [
+                {"role": "user", "content": "Record a real card payment for the design system."}
+            ],
+            "tools": [{"type": "function", "function": {"name": "website_get_graph_state"}}],
+            "stream": True,
+        },
+    )
+    assert response.status_code == 200
+    assert "can't charge a card" in response.text
+    assert "website_get_graph_state" not in response.text
 
 
 def test_frontend_build_is_served(client):

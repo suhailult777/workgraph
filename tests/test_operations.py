@@ -6,6 +6,8 @@ Every test runs against a freshly seeded temporary store. The committed
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from graph.db import connect
@@ -272,6 +274,142 @@ def test_nested_transaction_is_rejected(conn):
                 pass
 
     assert counts(conn) == before
+
+
+def test_a_milestone_with_two_invoices_is_rejected(conn):
+    conn.execute(
+        "CREATE (:Invoice {id: 'inv-h2-extra', number: 'WG-9999', status: 'SENT', "
+        "amount_cents: 240000})"
+    )
+    conn.execute(
+        "MATCH (m:Milestone {id: 'ms-h2'}), (i:Invoice {id: 'inv-h2-extra'}) "
+        "CREATE (m)-[:INVOICED]->(i)"
+    )
+    before = counts(conn)
+
+    with pytest.raises(GraphError) as error:
+        get_project(conn, "proj-harbour")
+    assert error.value.code == "multiple_invoices"
+
+    with pytest.raises(GraphError) as error:
+        preview_payment(conn, "inv-h2")
+    assert error.value.code == "multiple_invoices"
+
+    with pytest.raises(GraphError) as error:
+        record_payment(conn, "inv-h2", 240000)
+    assert error.value.code == "multiple_invoices"
+
+    with pytest.raises(GraphError) as error:
+        list_projects(conn)
+    assert error.value.code == "multiple_invoices"
+
+    assert counts(conn) == before
+
+
+def test_an_invoice_linked_to_two_milestones_is_rejected(conn):
+    conn.execute(
+        "MATCH (i:Invoice {id: 'inv-h2'}), (m:Milestone {id: 'ms-h3'}) "
+        "CREATE (m)-[:INVOICED]->(i)"
+    )
+    before = counts(conn)
+
+    with pytest.raises(GraphError) as error:
+        get_project(conn, "proj-harbour")
+    assert error.value.code == "ambiguous_invoice"
+
+    with pytest.raises(GraphError) as error:
+        preview_payment(conn, "inv-h2")
+    assert error.value.code == "ambiguous_invoice"
+
+    with pytest.raises(GraphError) as error:
+        record_payment(conn, "inv-h2", 240000)
+    assert error.value.code == "ambiguous_invoice"
+
+    assert counts(conn) == before
+
+
+def test_a_corrupt_other_project_blocks_a_payment_before_it_writes(conn):
+    conn.execute(
+        "CREATE (:Invoice {id: 'inv-a1-extra', number: 'WG-9998', status: 'SENT', "
+        "amount_cents: 1000})"
+    )
+    conn.execute(
+        "MATCH (m:Milestone {id: 'ms-a1'}), (i:Invoice {id: 'inv-a1-extra'}) "
+        "CREATE (m)-[:INVOICED]->(i)"
+    )
+    before = counts(conn)
+    before_status = status_map(conn)
+
+    with pytest.raises(GraphError) as error:
+        record_payment(conn, "inv-h2", 240000)
+    assert error.value.code == "multiple_invoices"
+
+    assert counts(conn) == before
+    assert status_map(conn) == before_status
+    invoice = conn.execute(
+        "MATCH (i:Invoice {id: 'inv-h2'}) RETURN i.status AS status"
+    ).fetchone()
+    assert invoice["status"] == "SENT"
+
+
+def test_a_wide_dependency_dag_reads_within_a_bound(conn):
+    layers = 8
+    width = 3
+    conn.execute("CREATE (:Project {id: 'proj-wide', name: 'Wide DAG', status: 'active'})")
+    for layer in range(layers):
+        for index in range(width):
+            milestone_id = f"wide-{layer}-{index}"
+            if layer == 0 and index == 0:
+                status = "BLOCKED"
+            elif layer == 7 and index == 2:
+                status = "SENT"
+            else:
+                status = "DONE"
+            conn.execute(
+                "CREATE (:Milestone {id: $id, name: $name, status: $status, "
+                "amount_cents: 1000, order: $order})",
+                {
+                    "id": milestone_id,
+                    "name": f"Wide {layer}-{index}",
+                    "status": status,
+                    "order": layer * width + index,
+                },
+            )
+            conn.execute(
+                "MATCH (p:Project {id: 'proj-wide'}), (m:Milestone {id: $id}) "
+                "CREATE (p)-[:HAS_MILESTONE]->(m)",
+                {"id": milestone_id},
+            )
+    for layer in range(layers - 1):
+        for index in range(width):
+            for other in range(width):
+                conn.execute(
+                    "MATCH (a:Milestone {id: $a}), (b:Milestone {id: $b}) "
+                    "CREATE (a)-[:DEPENDS_ON]->(b)",
+                    {"a": f"wide-{layer}-{index}", "b": f"wide-{layer + 1}-{other}"},
+                )
+    conn.execute(
+        "CREATE (:Invoice {id: 'wide-inv', number: 'WG-9000', status: 'SENT', "
+        "amount_cents: 1000})"
+    )
+    conn.execute(
+        "MATCH (m:Milestone {id: 'wide-7-2'}), (i:Invoice {id: 'wide-inv'}) "
+        "CREATE (m)-[:INVOICED]->(i)"
+    )
+
+    started = time.perf_counter()
+    project = get_project(conn, "proj-wide")
+    elapsed = time.perf_counter() - started
+
+    top = next(m for m in project["milestones"] if m["id"] == "wide-0-0")
+    assert 0 < len(top["blocked_by"]) <= 12
+    assert {blocker["reason"] for blocker in top["blocked_by"]} == {"unpaid_invoice"}
+    assert elapsed < 1.0
+
+    with pytest.raises(GraphError) as error:
+        complete_milestone(conn, "wide-0-0")
+    assert error.value.code == "blocked"
+
 
 
 

@@ -13,5 +13,15 @@ This product includes software developed by third parties:
 
 WorkGraph reuses ideas from the author's earlier MilestonePay project
 (milestone and sample-payment UX). No MilestonePay source files or git history
-were copied into this repository. Any later copied snippet must be disclosed
-here and in the submission write-up.
+were copied into this repository.
+
+The live deployment follows MilestonePay's architecture for two infrastructure
+pieces, rewritten for WorkGraph and disclosed here:
+
+- Vercel Blob snapshots with ETag compare-and-swap and retry for the durable
+  graph file.
+- PayPal Orders v2 sandbox create, capture, server-side amount/currency/order
+  verification, idempotent capture and webhook verification.
+
+The MilestonePay repository was read only as a reference and was not modified.
+Any later copied snippet must be disclosed here and in the submission write-up.

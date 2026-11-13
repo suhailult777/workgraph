@@ -1,9 +1,14 @@
 import type {
+  AppConfig,
+  DeclinePath,
   Health,
   PaymentPreview,
   PaymentResult,
+  PayPalCaptureResult,
+  PayPalOrderResult,
   ProjectDetail,
   ProjectSummary,
+  SimilarWork,
 } from "./types";
 
 export class ApiError extends Error {
@@ -56,6 +61,10 @@ export function getHealth(): Promise<Health> {
   return request<Health>("/api/health");
 }
 
+export function getConfig(): Promise<AppConfig> {
+  return request<AppConfig>("/api/config");
+}
+
 export function getProjects(): Promise<{ projects: ProjectSummary[] }> {
   return request<{ projects: ProjectSummary[] }>("/api/projects");
 }
@@ -68,6 +77,38 @@ export function createSampleProject(name: string): Promise<ProjectDetail> {
   return request<ProjectDetail>("/api/projects", {
     method: "POST",
     body: JSON.stringify({ name }),
+  });
+}
+
+export function acceptPlan(
+  projectName: string,
+  milestones: { name: string; depends_on: string[] }[],
+): Promise<{ accepted: boolean; project: ProjectDetail }> {
+  return request("/api/plans/accept", {
+    method: "POST",
+    body: JSON.stringify({ project_name: projectName, milestones }),
+  });
+}
+
+export function getDeclinePath(invoice: string): Promise<DeclinePath> {
+  return request<DeclinePath>(`/api/graph/decline-path?invoice=${encodeURIComponent(invoice)}`);
+}
+
+export function searchSimilarWork(skill: string): Promise<SimilarWork> {
+  return request<SimilarWork>(`/api/graph/similar?skill=${encodeURIComponent(skill)}`);
+}
+
+export function createPayPalOrder(invoiceId: string): Promise<PayPalOrderResult> {
+  return request<PayPalOrderResult>("/api/paypal/orders", {
+    method: "POST",
+    body: JSON.stringify({ invoice_id: invoiceId }),
+  });
+}
+
+export function capturePayPalOrder(orderId: string): Promise<PayPalCaptureResult> {
+  return request<PayPalCaptureResult>(`/api/paypal/orders/${encodeURIComponent(orderId)}/capture`, {
+    method: "POST",
+    body: JSON.stringify({}),
   });
 }
 

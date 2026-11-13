@@ -1,6 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ApiError, getPaymentPreview, money, recordPayment, statusLabel } from "../api";
-import type { PaymentPreview, PaymentResult } from "../types";
+import {
+  ApiError,
+  capturePayPalOrder,
+  createPayPalOrder,
+  getPaymentPreview,
+  money,
+  recordPayment,
+  statusLabel,
+} from "../api";
+import type { PaymentPreview, PaymentResult, PayPalOrderResult } from "../types";
 
 type Props = {
   invoiceId: string;
@@ -14,6 +22,10 @@ export function PaymentDialog({ invoiceId, onClose, onPaid }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [attempt, setAttempt] = useState(0);
+  const [paypalOrder, setPaypalOrder] = useState<PayPalOrderResult | null>(null);
+  const [paypalBusy, setPaypalBusy] = useState(false);
+  const [paypalError, setPaypalError] = useState<string | null>(null);
+  const [paypalMessage, setPaypalMessage] = useState<string | null>(null);
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
   const submittingRef = useRef(false);
@@ -66,6 +78,48 @@ export function PaymentDialog({ invoiceId, onClose, onPaid }: Props) {
       submittingRef.current = false;
       setError(reason instanceof ApiError ? reason.message : "The payment could not be recorded.");
       setSubmitting(false);
+    }
+  }
+
+  async function startPayPal() {
+    if (!preview || paypalBusy) return;
+    setPaypalBusy(true);
+    setPaypalError(null);
+    setPaypalMessage(null);
+    try {
+      const order = await createPayPalOrder(preview.invoice.id);
+      setPaypalOrder(order);
+    } catch (reason) {
+      setPaypalError(
+        reason instanceof ApiError ? reason.message : "The PayPal sandbox order could not be created.",
+      );
+    } finally {
+      setPaypalBusy(false);
+    }
+  }
+
+  async function capturePayPal() {
+    if (!paypalOrder || paypalBusy) return;
+    setPaypalBusy(true);
+    setPaypalError(null);
+    setPaypalMessage(null);
+    try {
+      const result = await capturePayPalOrder(paypalOrder.order.id);
+      if (result.payment) {
+        onPaid(result.payment);
+        return;
+      }
+      setPaypalMessage(
+        result.already_captured
+          ? "This order was already captured. No second payment was recorded."
+          : "The sandbox capture completed, but no payment payload came back.",
+      );
+    } catch (reason) {
+      setPaypalError(
+        reason instanceof ApiError ? reason.message : "The sandbox capture could not be verified.",
+      );
+    } finally {
+      setPaypalBusy(false);
     }
   }
 
@@ -171,6 +225,95 @@ export function PaymentDialog({ invoiceId, onClose, onPaid }: Props) {
               <p className="pay-note">{preview.note}</p>
             </section>
 
+            <section className="paypal-sandbox" aria-labelledby="paypal-title">
+              <div className="paypal-head">
+                <div>
+                  <p className="eyebrow">Sandbox only · no real money</p>
+                  <h3 id="paypal-title">PayPal sandbox checkout</h3>
+                </div>
+                {paypalOrder?.order.mock && <span className="paypal-mock">MOCK</span>}
+              </div>
+              <p className="pay-note">
+                The server creates a PayPal Orders v2 sandbox order, verifies the capture amount,
+                currency and order id, then records one sample ledger payment. It refuses any
+                non-sandbox host. A local mock is labelled MOCK and never calls PayPal.
+              </p>
+              {!paypalOrder && (
+                <button
+                  className="btn btn-secondary btn-small"
+                  type="button"
+                  onClick={startPayPal}
+                  disabled={paypalBusy}
+                >
+                  {paypalBusy ? "Creating sandbox order…" : "Start PayPal sandbox checkout"}
+                </button>
+              )}
+              {paypalOrder && (
+                <div className="paypal-order">
+                  <dl>
+                    <div>
+                      <dt>Order</dt>
+                      <dd>
+                        <code>{paypalOrder.order.id}</code>
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Amount</dt>
+                      <dd>{money(paypalOrder.amount_cents)}</dd>
+                    </div>
+                    <div>
+                      <dt>Status</dt>
+                      <dd>{paypalOrder.order.status}</dd>
+                    </div>
+                  </dl>
+                  {paypalOrder.order.mock ? (
+                    <button
+                      className="btn btn-primary btn-small"
+                      type="button"
+                      onClick={capturePayPal}
+                      disabled={paypalBusy}
+                    >
+                      {paypalBusy ? "Capturing…" : "Approve mock sandbox payment"}
+                    </button>
+                  ) : (
+                    <div className="paypal-actions">
+                      <a
+                        className="btn btn-secondary btn-small"
+                        href={paypalOrder.approve_url}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        Open sandbox checkout
+                      </a>
+                      <button
+                        className="btn btn-primary btn-small"
+                        type="button"
+                        onClick={capturePayPal}
+                        disabled={paypalBusy}
+                      >
+                        {paypalBusy ? "Capturing…" : "I approved, capture now"}
+                      </button>
+                    </div>
+                  )}
+                  {paypalMessage && (
+                    <p className="pay-note" role="status">
+                      {paypalMessage}
+                    </p>
+                  )}
+                  {paypalError && (
+                    <p className="alert alert-error" role="alert">
+                      {paypalError}
+                    </p>
+                  )}
+                </div>
+              )}
+              {!paypalOrder && paypalError && (
+                <p className="alert alert-error" role="alert">
+                  {paypalError}
+                </p>
+              )}
+            </section>
+
             {error && (
               <p className="alert alert-error" role="alert">
                 {error}
@@ -186,7 +329,8 @@ export function PaymentDialog({ invoiceId, onClose, onPaid }: Props) {
               </button>
             </footer>
             <p className="dialog-fineprint">
-              Writes to the local graph only. No card, no PayPal, no real money.
+              The sample button writes a sample ledger payment. The PayPal button uses sandbox
+              only. No card and no real money.
             </p>
           </>
         )}

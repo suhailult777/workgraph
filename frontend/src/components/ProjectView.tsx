@@ -1,5 +1,6 @@
 import { money } from "../api";
 import type { Blocker, Milestone, ProjectDetail } from "../types";
+import { GraphQueriesPanel } from "./GraphQueriesPanel";
 import { GraphView } from "./GraphView";
 import { StatusChip } from "./StatusChip";
 
@@ -205,6 +206,8 @@ export function ProjectView({
           to the deliverable it unlocks.
         </p>
       </section>
+
+      <GraphQueriesPanel project={project} />
 
       <div className="detail-grid">
         <section className="panel plan-panel" aria-labelledby="plan-title">

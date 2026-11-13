@@ -3,6 +3,7 @@ import {
   ApiError,
   completeMilestone,
   createSampleProject,
+  getConfig,
   getHealth,
   getProject,
   getProjects,
@@ -13,6 +14,7 @@ import { PaymentDialog } from "./components/PaymentDialog";
 import { ProjectView } from "./components/ProjectView";
 import { AssistantPanel } from "./components/AssistantPanel";
 import type {
+  AppConfig,
   Health,
   Milestone,
   PaymentResult,
@@ -42,6 +44,7 @@ function messageOf(reason: unknown): string {
 export default function App() {
   const [route, setRoute] = useState<Route>(() => parseHash());
   const [health, setHealth] = useState<Health | null>(null);
+  const [config, setConfig] = useState<AppConfig | null>(null);
 
   const [projects, setProjects] = useState<ProjectSummary[] | null>(null);
   const [projectsLoading, setProjectsLoading] = useState(true);
@@ -72,6 +75,18 @@ export default function App() {
     getHealth()
       .then(setHealth)
       .catch(() => setHealth(null));
+    getConfig()
+      .then(setConfig)
+      .catch(() => setConfig(null));
+  }, []);
+
+  useEffect(() => {
+    const onGraphChanged = () => {
+      setProjectsVersion((version) => version + 1);
+      setProjectVersion((version) => version + 1);
+    };
+    window.addEventListener("workgraph:graph", onGraphChanged);
+    return () => window.removeEventListener("workgraph:graph", onGraphChanged);
   }, []);
 
   useEffect(() => {
@@ -188,6 +203,20 @@ export default function App() {
     if (!health) return "Checking graph";
     return health.graph_ready ? "Graph ready" : "Graph missing";
   }, [health]);
+  const envBadge = !config
+    ? "CHECKING"
+    : config.assistant_live
+      ? "LIVE"
+      : config.environment === "production"
+        ? "NOT CONFIGURED"
+        : "DEV";
+  const envClass = !config
+    ? "is-checking"
+    : config.assistant_live
+      ? "is-live"
+      : config.environment === "production"
+        ? "is-missing"
+        : "is-dev";
 
   return (
     <>
@@ -215,6 +244,9 @@ export default function App() {
           >
             Ask
           </button>
+          <span className={`env-badge ${envClass}`} title="Assistant mode">
+            {envBadge}
+          </span>
           <span className={`live-dot${health?.graph_ready ? " is-ready" : ""}`} aria-hidden="true" />
           <span className="topbar-status">{healthLabel}</span>
           <span className="topbar-divider" aria-hidden="true" />
@@ -250,12 +282,13 @@ export default function App() {
         )}
       </main>
 
-      <AssistantPanel />
+      <AssistantPanel config={config} />
 
       <footer className="site-footer">
         <p>
-          Sample data only. No cards, no live PayPal, no real money. No live model call unless
-          you add your own key. Amounts are integer cents.
+          Sample ledger only. No cards, no real money. The live assistant uses a free
+          server-side model when configured; the local no-key demo is a development fallback.
+          PayPal is sandbox only. Amounts are integer cents.
         </p>
         <nav aria-label="Agent artifacts">
           <a href="/agent-manifest.json">agent manifest</a>

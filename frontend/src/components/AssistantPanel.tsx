@@ -1,11 +1,14 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
+import { acceptPlan } from "../api";
+import type { AppConfig } from "../types";
 
 const SETUP_KEY = "workgraph-byok-setup-v1";
 const DRAFT_KEY = "workgraph-plan-draft-v1";
 const SAMPLES = [
-  { label: "Blocked milestones", prompt: "Which milestones are blocked by an unpaid invoice?" },
+  { label: "Decline path", prompt: "Which milestones are blocked until WG-1002 is paid?" },
   { label: "Paid design work", prompt: "Who has been paid for design-system work before?" },
   { label: "Draft a plan", prompt: "Draft a four-step plan for a new brand project." },
+  { label: "Record payment", prompt: "Record the sample payment for WG-1002." },
   { label: "Card charge?", prompt: "Record a real card payment for the design system." },
 ];
 
@@ -17,6 +20,18 @@ type Draft = {
   milestones?: { name: string; depends_on?: string[] }[];
   similar_work?: { party?: string; project?: string; milestone?: string }[];
   note?: string;
+};
+
+type ConfirmItem = {
+  action: string;
+  description?: string;
+  effect?: string;
+  arguments?: Record<string, unknown>;
+};
+
+type ConfirmRequest = {
+  items: ConfirmItem[];
+  resolve: (approved: boolean) => void;
 };
 
 function readSetup(): Setup | null {
@@ -116,7 +131,98 @@ function validateRouter(value: string): { ok: true; url: string } | { ok: false;
   return { ok: true, url: parsed.href.replace(/\/+$/, "") };
 }
 
-export function AssistantPanel() {
+function actionTitle(action: string): string {
+  if (action === "accept_plan") return "Accept the plan and create the project";
+  if (action === "record_payment") return "Record the sample payment";
+  return action.replaceAll("_", " ");
+}
+
+function ConfirmDialog({
+  request,
+  onAnswer,
+}: {
+  request: ConfirmRequest;
+  onAnswer: (approved: boolean) => void;
+}) {
+  return (
+    <div className="assistant-confirm-backdrop">
+      <div
+        className="assistant-confirm"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="assistant-confirm-title"
+      >
+        <p className="eyebrow">Irreversible · review first</p>
+        <h3 id="assistant-confirm-title">
+          {request.items.length === 1
+            ? actionTitle(request.items[0].action)
+            : "Confirm these graph changes"}
+        </h3>
+        {request.items.map((item) => {
+          const args = item.arguments || {};
+          const milestones = Array.isArray(args.milestones) ? args.milestones : [];
+          return (
+            <div className="assistant-confirm-item" key={item.action}>
+              {item.description && <p className="assistant-confirm-desc">{item.description}</p>}
+              {typeof args.projectName === "string" && (
+                <p>
+                  Project: <strong>{args.projectName}</strong>
+                </p>
+              )}
+              {milestones.length > 0 && (
+                <ol className="assistant-confirm-plan">
+                  {milestones.map((step) => {
+                    const record = step as { name?: string; depends_on?: string[] };
+                    return (
+                      <li key={record.name}>
+                        <strong>{record.name}</strong>
+                        {record.depends_on?.length
+                          ? ` after ${record.depends_on.join(", ")}`
+                          : " first"}
+                      </li>
+                    );
+                  })}
+                </ol>
+              )}
+              {typeof args.invoiceId === "string" && (
+                <p>
+                  Invoice id: <code>{args.invoiceId}</code>
+                </p>
+              )}
+              {typeof args.amountCents === "number" && (
+                <p>
+                  Amount: <strong>{args.amountCents.toLocaleString("en-US")} integer cents</strong>
+                </p>
+              )}
+            </div>
+          );
+        })}
+        <p className="assistant-confirm-note">
+          The graph changes only after you confirm. Cancel leaves it exactly as it is.
+        </p>
+        <div className="assistant-confirm-actions">
+          <button
+            className="btn btn-secondary"
+            type="button"
+            onClick={() => onAnswer(false)}
+          >
+            Cancel · change nothing
+          </button>
+          <button
+            className="btn btn-primary"
+            type="button"
+            autoFocus
+            onClick={() => onAnswer(true)}
+          >
+            Confirm and write
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function AssistantPanel({ config }: { config: AppConfig | null }) {
   const [setup] = useState<Setup | null>(() => readSetup());
   const [baseUrl, setBaseUrl] = useState(setup?.baseUrl ?? "");
   const [model, setModel] = useState(setup?.model ?? "gpt-4.1-mini");
@@ -126,8 +232,24 @@ export function AssistantPanel() {
   const [bootOk, setBootOk] = useState<boolean | null>(null);
   const [bootAttempt, setBootAttempt] = useState(0);
   const [draft, setDraft] = useState<Draft | null>(() => readDraft());
+  const [actionMessage, setActionMessage] = useState<string | null>(null);
+  const [confirmRequest, setConfirmRequest] = useState<ConfirmRequest | null>(null);
   const hostRef = useRef<HTMLDivElement>(null);
   const hasKey = Boolean(setup?.key && setup?.baseUrl);
+  const live = Boolean(config?.assistant_live);
+  const production = config?.environment === "production";
+
+  function requestConfirmation(items: ConfirmItem[]): Promise<boolean> {
+    return new Promise((resolve) => {
+      setConfirmRequest({ items, resolve });
+    });
+  }
+
+  function answerConfirmation(approved: boolean) {
+    const current = confirmRequest;
+    setConfirmRequest(null);
+    current?.resolve(approved);
+  }
 
   useEffect(() => {
     const onDraft = (event: Event) => {
@@ -141,6 +263,18 @@ export function AssistantPanel() {
   useEffect(() => {
     const host = hostRef.current;
     if (!host || host.dataset.workgraphAssistant) return;
+    if (!config && !hasKey) {
+      setBootOk(null);
+      setBootMessage("Checking assistant configuration…");
+      return;
+    }
+    if (!hasKey && production && !live) {
+      setBootOk(false);
+      setBootMessage(
+        "The live assistant is not configured on this deployment. No demo fallback runs in production.",
+      );
+      return;
+    }
     host.dataset.workgraphAssistant = "booting";
     host.innerHTML = `
       <div id="agent-app" class="assistant-runtime">
@@ -165,32 +299,45 @@ export function AssistantPanel() {
         };
         const root = host.querySelector("#agent-app");
         if (!root) throw new Error("Assistant mount is missing.");
+        const router = hasKey ? setup?.baseUrl : live ? "/api/assistant" : "/api/demo/llm";
+        const byokKey = hasKey ? setup?.key : live ? "server" : "local-demo";
+        let selectedModel = hasKey ? setup?.model || "gpt-4.1-mini" : live ? "server" : " ";
+        if (!hasKey && live) {
+          try {
+            const response = await fetch("/api/assistant/models", { cache: "no-store" });
+            const body = await response.json();
+            const first = Array.isArray(body?.data) ? body.data[0]?.id : "";
+            if (first) selectedModel = String(first);
+          } catch {
+            // The runtime falls back to the server's first allowlisted model.
+          }
+        }
         const { engine } = await runtime.boot(root, {
           originUrl: new URL("/", window.location.href).href,
           sandboxWorkerUrl: new URL("/runtime/sandbox-worker.js", window.location.href).href,
-          byokKey: hasKey ? setup?.key : "demo",
-          router: hasKey ? setup?.baseUrl : "/api/demo/llm",
-          // A blank model keeps the runtime on the published mock router. A real model
-          // name makes selectTopRouter upgrade to byok_router even without a key.
-          model: hasKey ? setup?.model || "gpt-4.1-mini" : " ",
+          byokKey,
+          router,
+          model: selectedModel,
           runner: "manual",
         });
-        // The runtime's own settings panel is hidden; clear any saved profile it copied
-        // into its key field so a pre-existing nsDeploy key is not left in the DOM.
+        engine.onActionConfirm = (items: unknown) =>
+          requestConfirmation(Array.isArray(items) ? (items as ConfirmItem[]) : []);
         const hiddenKey = host.querySelector<HTMLInputElement>("#ns-key");
         if (hiddenKey) hiddenKey.value = "";
         (window as unknown as { __workgraphAssistant?: unknown }).__workgraphAssistant = engine;
         const greeting =
           "I read the same sample graph as the page. Ask me which milestones are blocked, " +
-          "who was paid for a skill, or for a draft milestone plan. I cannot charge a card, " +
-          "take real money, send email or write the graph.";
+          "who was paid for a skill, or for a plan. I can accept a plan or record a sample " +
+          "payment after you confirm the dialog. I cannot charge a card, take real money or send email.";
         const first = host.querySelector("#ns-msgs .ns-msg.bot");
         if (first) first.textContent = greeting;
         setBootOk(true);
         setBootMessage(
           hasKey
             ? `Your key is loaded in this tab and is sent only to ${setup?.baseUrl}.`
-            : "Demo model connected. No key is needed. Every answer comes from the sample graph.",
+            : live
+              ? "Live assistant connected. It uses a free server-side model and the same graph."
+              : "Local demo model connected. This is a development fallback, not production.",
         );
       } catch (error) {
         const hiddenKey = host.querySelector<HTMLInputElement>("#ns-key");
@@ -201,7 +348,7 @@ export function AssistantPanel() {
       }
     };
     void bootAssistant();
-  }, [hasKey, setup, bootAttempt]);
+  }, [hasKey, setup, bootAttempt, live, production, config]);
 
   function retryBoot() {
     const host = hostRef.current;
@@ -223,7 +370,7 @@ export function AssistantPanel() {
       return;
     }
     if (!key.trim()) {
-      setFormError("Enter a key, or keep using the demo model.");
+      setFormError("Enter a key, or keep using the server assistant.");
       return;
     }
     const next: Setup = {
@@ -239,7 +386,7 @@ export function AssistantPanel() {
     }
   }
 
-  function useDemo() {
+  function useDefault() {
     try {
       sessionStorage.removeItem(SETUP_KEY);
       window.location.reload();
@@ -257,6 +404,39 @@ export function AssistantPanel() {
     setDraft(null);
   }
 
+  async function acceptDraft() {
+    if (!draft) return;
+    const milestones = (draft.milestones ?? []).map((milestone) => ({
+      name: milestone.name,
+      depends_on: milestone.depends_on ?? [],
+    }));
+    const approved = await requestConfirmation([
+      {
+        action: "accept_plan",
+        description:
+          "Create the four-step sample project. The server assigns the sample amounts; no real money moves.",
+        arguments: { projectName: draft.projectName || "New project", milestones },
+      },
+    ]);
+    if (!approved) {
+      setActionMessage("Plan not accepted. The graph is unchanged.");
+      return;
+    }
+    setActionMessage("Creating the project…");
+    try {
+      const result = await acceptPlan(draft.projectName || "New project", milestones);
+      clearDraft();
+      setActionMessage(
+        `Accepted ${result.project.project.name} [${result.project.project.id}]. The board now has it.`,
+      );
+      window.dispatchEvent(new Event("workgraph:graph"));
+    } catch (reason) {
+      setActionMessage(
+        reason instanceof Error ? reason.message : "The plan could not be accepted.",
+      );
+    }
+  }
+
   function askSample(prompt: string) {
     const input = hostRef.current?.querySelector<HTMLInputElement>("#ns-input");
     const send = hostRef.current?.querySelector<HTMLButtonElement>("#ns-send");
@@ -266,6 +446,15 @@ export function AssistantPanel() {
     send.click();
   }
 
+  const modeLabel = hasKey
+    ? "Your router"
+    : live
+      ? "Live server"
+      : production
+        ? "Not configured"
+        : "Local demo";
+  const modeClass = hasKey || live ? "is-live" : production ? "is-missing" : "is-demo";
+
   return (
     <section id="assistant" className="assistant-section" aria-labelledby="assistant-title">
       <div className="assistant-heading">
@@ -274,16 +463,23 @@ export function AssistantPanel() {
           <h2 id="assistant-title">Ask the graph</h2>
           <p className="assistant-lede">
             The assistant reads the same projects, blocked paths and sample payments as the page.
-            It can draft a plan. It cannot charge a card, send email or write the graph.
+            It can accept a plan or record a sample payment after you confirm the dialog. It never
+            charges a card, sends email or moves real money.
           </p>
         </div>
         <div className="assistant-mode-box">
-          <span className={`assistant-mode ${hasKey ? "is-live" : "is-demo"}`}>
+          <span className={`assistant-mode ${modeClass}`}>
             <span className="assistant-mode-dot" aria-hidden="true" />
-            {hasKey ? "Your router" : "Demo model"}
+            {modeLabel}
           </span>
           <span className="assistant-mode-note">
-            {hasKey ? "Key kept in this tab" : "No key needed"}
+            {hasKey
+              ? "Key kept in this tab"
+              : live
+                ? "Free server model"
+                : production
+                  ? "Set OPENROUTER_API_KEY"
+                  : "No key needed"}
           </span>
         </div>
       </div>
@@ -319,8 +515,9 @@ export function AssistantPanel() {
             <p className="eyebrow">Bring your own key</p>
             <h3 id="byok-title">Use your own router</h3>
             <p className="assistant-card-copy">
-              The demo model needs no key. A real key stays in this tab's sessionStorage and is
-              sent only to the router you choose. WorkGraph's server never receives it.
+              The live server assistant is the default when configured. A real key here stays in
+              this tab's sessionStorage and is sent only to the router you choose. WorkGraph's
+              server never receives it.
             </p>
             {hasKey ? (
               <div className="byok-loaded">
@@ -339,8 +536,8 @@ export function AssistantPanel() {
                   </div>
                 </dl>
                 <div className="byok-actions">
-                  <button className="btn btn-secondary btn-small" type="button" onClick={useDemo}>
-                    Forget key and use demo
+                  <button className="btn btn-secondary btn-small" type="button" onClick={useDefault}>
+                    Forget key and use the default
                   </button>
                 </div>
               </div>
@@ -385,8 +582,8 @@ export function AssistantPanel() {
                   <button className="btn btn-primary btn-small" type="submit">
                     Use this key
                   </button>
-                  <button className="btn btn-secondary btn-small" type="button" onClick={useDemo}>
-                    Demo mode
+                  <button className="btn btn-secondary btn-small" type="button" onClick={useDefault}>
+                    Use default
                   </button>
                 </div>
                 <p className="byok-fineprint">
@@ -398,17 +595,18 @@ export function AssistantPanel() {
           </section>
 
           <section className="assistant-card assistant-limits" aria-labelledby="limits-title">
-            <p className="eyebrow">This milestone</p>
+            <p className="eyebrow">Confirmed writes</p>
             <h3 id="limits-title">What it can do</h3>
             <ul>
-              <li>Read projects, milestone statuses, blocked paths, invoices and sample payments.</li>
-              <li>Find paid work by a skill through the graph traversal.</li>
-              <li>Draft a four-step plan in this tab. No amounts, no graph write.</li>
+              <li>Read projects, milestone ids, blocked paths, invoices and sample payments.</li>
+              <li>Trace every milestone blocked until one invoice is paid.</li>
+              <li>Draft a four-step plan, then accept it after you confirm.</li>
+              <li>Record one sample payment for the exact invoice amount after you confirm.</li>
             </ul>
             <p className="assistant-card-copy">
-              It cannot accept a plan, record a sample payment, unlock a deliverable, charge a
-              card, take real money, send email or call live PayPal. Use the project page for
-              sample payments.
+              Cancel leaves the graph unchanged. The assistant cannot charge a card, take real
+              money, send email or call live PayPal. PayPal sandbox checkout is a separate button
+              on the project page.
             </p>
           </section>
 
@@ -430,15 +628,29 @@ export function AssistantPanel() {
               </ol>
               <p className="assistant-card-copy">
                 {draft.note ||
-                  "Saved in this tab only. The graph did not change. Accepting a plan is not available yet."}
+                  "Saved in this tab only. The graph did not change. Accept it only after you review the dialog."}
               </p>
-              <button className="btn btn-secondary btn-small" type="button" onClick={clearDraft}>
-                Clear draft
-              </button>
+              <div className="byok-actions">
+                <button className="btn btn-primary btn-small" type="button" onClick={acceptDraft}>
+                  Accept plan
+                </button>
+                <button className="btn btn-secondary btn-small" type="button" onClick={clearDraft}>
+                  Clear draft
+                </button>
+              </div>
+              {actionMessage && (
+                <p className="assistant-card-copy" role="status">
+                  {actionMessage}
+                </p>
+              )}
             </section>
           )}
         </aside>
       </div>
+
+      {confirmRequest && (
+        <ConfirmDialog request={confirmRequest} onAnswer={answerConfirmation} />
+      )}
     </section>
   );
 }

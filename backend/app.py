@@ -288,6 +288,7 @@ def create_app(
     def config() -> dict:
         return {
             "assistant_live": assistant_service.configured,
+            "assistant_mock": bool(getattr(assistant_service, "mock", False)),
             "paypal_sandbox_configured": paypal_client.configured,
             "storage_kind": selected_storage.kind,
             "environment": "production" if _is_production() else "development",
@@ -424,7 +425,9 @@ def create_app(
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-store",
-                "X-Nsdeploy-LLM-Route": "live",
+                "X-Nsdeploy-LLM-Route": "mock"
+                if getattr(app.state.assistant, "mock", False)
+                else "live",
             },
         )
 

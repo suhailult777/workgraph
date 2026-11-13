@@ -146,6 +146,7 @@ milestone names and dependencies, no amounts, and has **Accept plan** and
 ```json
 {
   "assistant_live": true,
+  "assistant_mock": false,
   "paypal_sandbox_configured": true,
   "storage_kind": "vercel_blob",
   "environment": "production"

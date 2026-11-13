@@ -134,6 +134,7 @@ export type Health = {
 
 export type AppConfig = {
   assistant_live: boolean;
+  assistant_mock: boolean;
   paypal_sandbox_configured: boolean;
   storage_kind: string;
   environment: "production" | "development" | string;

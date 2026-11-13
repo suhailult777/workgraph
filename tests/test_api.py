@@ -387,11 +387,13 @@ def test_config_reports_booleans_without_secrets(client):
     body = client.get("/api/config").json()
     assert set(body) == {
         "assistant_live",
+        "assistant_mock",
         "paypal_sandbox_configured",
         "storage_kind",
         "environment",
     }
     assert isinstance(body["assistant_live"], bool)
+    assert isinstance(body["assistant_mock"], bool)
     assert isinstance(body["paypal_sandbox_configured"], bool)
     assert body["storage_kind"] == "local_file"
     assert "secret" not in json.dumps(body).lower()
@@ -442,7 +444,7 @@ def test_assistant_endpoint_reports_quota_and_returns_sse(tmp_path):
         )
         assert first.status_code == 200
         assert first.headers["content-type"].startswith("text/event-stream")
-        assert first.headers["x-nsdeploy-llm-route"] == "live"
+        assert first.headers["x-nsdeploy-llm-route"] == "mock"
         assert "data: [DONE]" in first.text
 
         second = client.post(

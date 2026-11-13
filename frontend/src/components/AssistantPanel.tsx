@@ -237,6 +237,7 @@ export function AssistantPanel({ config }: { config: AppConfig | null }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const hasKey = Boolean(setup?.key && setup?.baseUrl);
   const live = Boolean(config?.assistant_live);
+  const mock = Boolean(config?.assistant_mock);
   const production = config?.environment === "production";
 
   function requestConfirmation(items: ConfirmItem[]): Promise<boolean> {
@@ -294,7 +295,10 @@ export function AssistantPanel({ config }: { config: AppConfig | null }) {
             root: Element,
             options: Record<string, unknown>,
           ) => Promise<{
-            engine: { onActionConfirm: (items: unknown) => Promise<boolean> };
+            engine: {
+              onActionConfirm: (items: unknown) => Promise<boolean>;
+              mockLLM?: boolean;
+            };
           }>;
         };
         const root = host.querySelector("#agent-app");
@@ -322,6 +326,7 @@ export function AssistantPanel({ config }: { config: AppConfig | null }) {
         });
         engine.onActionConfirm = (items: unknown) =>
           requestConfirmation(Array.isArray(items) ? (items as ConfirmItem[]) : []);
+        if (mock) engine.mockLLM = true;
         const hiddenKey = host.querySelector<HTMLInputElement>("#ns-key");
         if (hiddenKey) hiddenKey.value = "";
         (window as unknown as { __workgraphAssistant?: unknown }).__workgraphAssistant = engine;
@@ -336,7 +341,9 @@ export function AssistantPanel({ config }: { config: AppConfig | null }) {
           hasKey
             ? `Your key is loaded in this tab and is sent only to ${setup?.baseUrl}.`
             : live
-              ? "Live assistant connected. It uses a free server-side model and the same graph."
+              ? mock
+                ? "Live endpoint connected with the local mock model. No provider was called."
+                : "Live assistant connected. It uses a free server-side model and the same graph."
               : "Local demo model connected. This is a development fallback, not production.",
         );
       } catch (error) {
@@ -348,7 +355,7 @@ export function AssistantPanel({ config }: { config: AppConfig | null }) {
       }
     };
     void bootAssistant();
-  }, [hasKey, setup, bootAttempt, live, production, config]);
+  }, [hasKey, setup, bootAttempt, live, production, config, mock]);
 
   function retryBoot() {
     const host = hostRef.current;
@@ -449,7 +456,9 @@ export function AssistantPanel({ config }: { config: AppConfig | null }) {
   const modeLabel = hasKey
     ? "Your router"
     : live
-      ? "Live server"
+      ? mock
+        ? "Live mock"
+        : "Live server"
       : production
         ? "Not configured"
         : "Local demo";
@@ -476,7 +485,9 @@ export function AssistantPanel({ config }: { config: AppConfig | null }) {
             {hasKey
               ? "Key kept in this tab"
               : live
-                ? "Free server model"
+                ? mock
+                  ? "Local mock upstream"
+                  : "Free server model"
                 : production
                   ? "Set OPENROUTER_API_KEY"
                   : "No key needed"}

@@ -7,8 +7,11 @@ TOOLS = [
     for name in (
         "website_get_graph_state",
         "website_search_similar_work",
+        "website_get_decline_path",
         "website_propose_plan",
         "website_fill_draft",
+        "website_accept_plan",
+        "website_record_payment",
         "render_cruse",
     )
 ]
@@ -19,12 +22,26 @@ STATE_RECEIPT = {
     "result": {
         "projects": [
             {
+                "id": "proj-harbour",
                 "name": "Harbour rebrand",
                 "status": "active",
                 "stats": {"milestones": 4, "done": 1, "blocked": 2, "paid_cents": 180000, "total_cents": 830000},
                 "milestones": [
-                    {"name": "Discovery", "status": "DONE", "blocked_by": []},
+                    {"id": "ms-h1", "name": "Discovery", "status": "DONE", "blocked_by": []},
                     {
+                        "id": "ms-h2",
+                        "name": "Design system",
+                        "status": "SENT",
+                        "invoice": {
+                            "id": "inv-h2",
+                            "number": "WG-1002",
+                            "status": "SENT",
+                            "amount_cents": 240000,
+                        },
+                        "blocked_by": [],
+                    },
+                    {
+                        "id": "ms-h3",
                         "name": "Build",
                         "status": "BLOCKED",
                         "blocked_by": [
@@ -39,6 +56,7 @@ STATE_RECEIPT = {
                 ],
             },
             {
+                "id": "proj-atlas",
                 "name": "Atlas dashboard",
                 "status": "paid",
                 "stats": {"milestones": 2, "done": 2, "blocked": 0, "paid_cents": 380000, "total_cents": 380000},
@@ -180,16 +198,65 @@ def test_draft_question_calls_the_draft_tool():
     assert reply["tool_call"]["name"] == "website_fill_draft"
 
 
-def test_accept_plan_is_refused_without_a_tool_call():
+def test_accept_plan_calls_the_irreversible_action():
     reply = demo_reply(
         {
             "messages": [{"role": "user", "content": "Accept the plan and write it to the graph."}],
             "tools": TOOLS,
         }
     )
-    assert reply["tool_call"] is None
-    assert "not available" in reply["content"]
-    assert "project page" in reply["content"]
+    assert reply["tool_call"]["name"] == "website_accept_plan"
+    assert reply["tool_call"]["arguments"]["projectName"] == "New project"
+    assert [step["name"] for step in reply["tool_call"]["arguments"]["milestones"]] == [
+        "Scope",
+        "Design",
+        "Build",
+        "Handover",
+    ]
+
+
+def test_decline_path_question_calls_the_invoice_traversal():
+    reply = demo_reply(
+        {
+            "messages": [
+                {"role": "user", "content": "Which milestones are blocked until WG-1002 is paid?"}
+            ],
+            "tools": TOOLS,
+        }
+    )
+    assert reply["tool_call"]["name"] == "website_get_decline_path"
+    assert reply["tool_call"]["arguments"] == {"invoice": "WG-1002"}
+
+
+def test_record_payment_reads_the_state_then_asks_to_record_the_exact_invoice():
+    first = demo_reply(
+        {
+            "messages": [
+                {"role": "user", "content": "Record the sample payment for WG-1002."}
+            ],
+            "tools": TOOLS,
+        }
+    )
+    assert first["tool_call"]["name"] == "website_get_graph_state"
+
+    second = demo_reply(
+        {
+            "messages": [
+                {"role": "user", "content": "Record the sample payment for WG-1002."},
+                {
+                    "role": "tool",
+                    "name": "website_get_graph_state",
+                    "content": json.dumps(STATE_RECEIPT),
+                },
+            ],
+            "tools": TOOLS,
+        }
+    )
+    assert second["tool_call"]["name"] == "website_record_payment"
+    assert second["tool_call"]["arguments"] == {
+        "invoiceId": "inv-h2",
+        "amountCents": 240000,
+    }
 
 
 def test_graph_state_result_produces_a_grounded_blocked_answer():
@@ -315,3 +382,82 @@ def test_plan_and_draft_results_use_the_returned_milestones():
     )
     assert "Saved a draft plan" in fill_reply["content"]
     assert "Scope -> Design" in fill_reply["content"]
+
+def test_decline_result_cites_the_invoice_and_blocked_ids():
+    receipt = {
+        "action": "website_get_decline_path",
+        "status": "succeeded",
+        "result": {
+            "invoice": {"id": "inv-h2", "number": "WG-1002", "status": "SENT", "amount_cents": 240000},
+            "milestone": {"id": "ms-h2", "name": "Design system"},
+            "blocked": [
+                {"blocked_id": "ms-h3", "blocked": "Build", "status": "BLOCKED", "reason": "unpaid_invoice"},
+                {"blocked_id": "ms-h4", "blocked": "Handover", "status": "BLOCKED", "reason": "unpaid_invoice"},
+            ],
+            "blocked_count": 2,
+        },
+    }
+    reply = demo_reply(
+        {
+            "messages": [
+                {"role": "user", "content": "Which milestones are blocked until WG-1002 is paid?"},
+                {"role": "tool", "name": "website_get_decline_path", "content": json.dumps(receipt)},
+            ],
+            "tools": TOOLS,
+        }
+    )
+    assert "WG-1002" in reply["content"]
+    assert "Build [ms-h3]" in reply["content"]
+    assert "Handover [ms-h4]" in reply["content"]
+
+
+def test_accept_result_cites_the_project_and_milestone_ids():
+    receipt = {
+        "action": "website_accept_plan",
+        "status": "succeeded",
+        "result": {
+            "accepted": True,
+            "project": {"project": {"id": "proj-new", "name": "Brand refresh"}},
+            "node_ids": {
+                "project": "proj-new",
+                "milestones": ["ms-new-1", "ms-new-2", "ms-new-3", "ms-new-4"],
+                "invoices": ["inv-new-1", "inv-new-2"],
+            },
+        },
+    }
+    reply = demo_reply(
+        {
+            "messages": [
+                {"role": "user", "content": "Accept the plan for a brand project."},
+                {"role": "tool", "name": "website_accept_plan", "content": json.dumps(receipt)},
+            ],
+            "tools": TOOLS,
+        }
+    )
+    assert "Brand refresh [proj-new]" in reply["content"]
+    assert "ms-new-1" in reply["content"]
+
+
+def test_payment_result_cites_the_payment_invoice_and_deliverable():
+    receipt = {
+        "action": "website_record_payment",
+        "status": "succeeded",
+        "result": {
+            "payment_id": "pay-test",
+            "invoice_id": "inv-h2",
+            "amount_cents": 240000,
+            "unlocked": [{"id": "del-h2", "name": "Design system kit"}],
+        },
+    }
+    reply = demo_reply(
+        {
+            "messages": [
+                {"role": "user", "content": "Record the sample payment for WG-1002."},
+                {"role": "tool", "name": "website_record_payment", "content": json.dumps(receipt)},
+            ],
+            "tools": TOOLS,
+        }
+    )
+    assert "pay-test" in reply["content"]
+    assert "inv-h2" in reply["content"]
+    assert "Design system kit [del-h2]" in reply["content"]

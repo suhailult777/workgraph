@@ -1,9 +1,9 @@
 """A deterministic scripted model for the no-key WorkGraph demo.
 
-This is not an LLM. It chooses one registered read action from the visitor's
-message, then writes an answer from the action receipt. The same module is used
-by the local FastAPI demo router and by the tests, so no key or network model is
-needed to try the assistant.
+This is not an LLM. It chooses one registered action from the visitor's message,
+then writes an answer from the action receipt. The same module is used by the
+local FastAPI demo router and by the tests. The demo is a local-development
+fallback only; a production deployment uses the server-side live assistant.
 """
 
 from __future__ import annotations
@@ -13,6 +13,12 @@ import re
 from typing import Any
 
 MODEL = "workgraph-demo"
+PLAN_TEMPLATE = [
+    {"name": "Scope", "depends_on": []},
+    {"name": "Design", "depends_on": ["Scope"]},
+    {"name": "Build", "depends_on": ["Design"]},
+    {"name": "Handover", "depends_on": ["Build"]},
+]
 SKILLS = {
     "design": "Design systems",
     "design-system": "Design systems",
@@ -66,8 +72,8 @@ def _refusal(message: str) -> str | None:
     if card and charge:
         return (
             "I can't charge a card, take real money, or send email from WorkGraph. "
-            "This site records sample payments only, and those are recorded by you on the "
-            "project page. I can show the blocked paths, invoices and paid history."
+            "This site records sample payments only. I can show the blocked paths, "
+            "invoices and paid history."
         )
     if any(
         phrase in lower
@@ -83,8 +89,8 @@ def _refusal(message: str) -> str | None:
     ) or re.search(r"\bwire\b", lower):
         return (
             "I can't charge a card, take real money, or send email from WorkGraph. "
-            "This site records sample payments only, and those are recorded by you on the "
-            "project page. I can show the blocked paths, invoices and paid history."
+            "This site records sample payments only. I can show the blocked paths, "
+            "invoices and paid history."
         )
     if "email" in lower and re.search(r"\b(?:send|email)\b", lower):
         return (
@@ -93,34 +99,22 @@ def _refusal(message: str) -> str | None:
         )
     if "mark" in lower and "invoice" in lower and re.search(r"\bpaid\b", lower):
         return (
-            "I can't mark an invoice paid or write the graph in this milestone. Use the "
-            "project page's Record sample payment button; it previews the exact change and "
-            "asks you to confirm."
-        )
-    if "accept" in lower and "plan" in lower:
-        return (
-            "Accepting a plan is not available in this milestone, so the graph stays "
-            "unchanged. Use the project page for now; accepting a plan arrives in the next "
-            "milestone."
+            "I can't mark an invoice paid directly. Ask me to record the sample payment and "
+            "confirm the dialog; the graph changes only after you confirm."
         )
     if re.search(
         r"\b(?:create|add|delete|remove|update|set|write|save|change|rename)\b", lower
     ) and re.search(r"\b(?:project|milestone|status|graph|invoice|deliverable)\b", lower):
-        return (
-            "I can't create, change or delete graph data from chat in this milestone. The "
-            "project page is the only place for sample payments and graph changes. I can show "
-            "the projects, blocked paths and paid history."
-        )
-    if re.search(r"\brecord\b", lower) and "payment" in lower:
-        return (
-            "Recording a sample payment from chat is not available in this milestone. "
-            "Use the Record sample payment button on the project page: it previews the "
-            "exact graph change and asks you to confirm."
-        )
+        if "accept" not in lower and not re.search(r"\brecord\b", lower):
+            return (
+                "I can't create, change or delete graph data directly. Draft a plan and accept "
+                "it, or record a sample payment, and confirm the dialog. I can also show the "
+                "projects, blocked paths and paid history."
+            )
     if re.search(r"\bunlock\b", lower) and "deliverable" in lower:
         return (
-            "Unlocking a deliverable is not available from chat. A sample payment on the "
-            "project page unlocks only the paid milestone's deliverable."
+            "Unlocking a deliverable happens only through a confirmed sample payment. "
+            "The payment unlocks only that milestone's deliverable."
         )
     return None
 
@@ -133,12 +127,41 @@ def _skill_for(message: str) -> str | None:
     return None
 
 
+def _invoice_number(message: str) -> str | None:
+    match = re.search(r"\bWG-\d+\b", message.upper())
+    return match.group(0) if match else None
+
+
+def _project_name(message: str) -> str:
+    lower = message.lower()
+    if "brand" in lower:
+        return "Brand refresh"
+    if "research" in lower:
+        return "Research project"
+    return "New project"
+
+
 def _choose(message: str, offered: set[str]) -> tuple[str | None, dict]:
     lower = message.lower()
+    if "accept" in lower and "plan" in lower:
+        return "website_accept_plan", {
+            "projectName": _project_name(message),
+            "milestones": PLAN_TEMPLATE,
+        }
+    if re.search(r"\brecord\b", lower) and "payment" in lower:
+        return "website_get_graph_state", {}
     if re.search(r"\bfill\b", lower) and ("draft" in lower or "plan" in lower):
         return "website_fill_draft", {"brief": message}
     if "plan" in lower or "propose" in lower or "draft" in lower:
         return "website_propose_plan", {"brief": message}
+    if (
+        ("blocked" in lower or "decline" in lower)
+        and ("until" in lower or "paid" in lower or "invoice" in lower)
+    ) or "decline path" in lower:
+        invoice = _invoice_number(message)
+        if invoice:
+            return "website_get_decline_path", {"invoice": invoice}
+        return "website_get_graph_state", {}
     if any(
         phrase in lower
         for phrase in ("similar", "who has been paid", "paid for", "worked before", "worked on")
@@ -167,6 +190,21 @@ def _receipt(content: Any) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def _find_invoice(result: dict, number: str | None) -> dict | None:
+    for project in result.get("projects") or []:
+        for milestone in project.get("milestones") or []:
+            invoice = milestone.get("invoice")
+            if not invoice or invoice.get("status") != "SENT":
+                continue
+            if number is None or invoice.get("number") == number:
+                return {
+                    **invoice,
+                    "project_id": project.get("id"),
+                    "milestone_id": milestone.get("id"),
+                }
+    return None
+
+
 def _blocked_cause(blocker: dict) -> str:
     if blocker.get("reason") == "unpaid_invoice":
         return (
@@ -191,7 +229,7 @@ def _answer_graph_state(result: dict, message: str) -> str:
             for milestone in project.get("milestones") or []:
                 for blocker in milestone.get("blocked_by") or []:
                     entries.append(
-                        f"{milestone.get('name')} is blocked by "
+                        f"{milestone.get('name')} [{milestone.get('id')}] is blocked by "
                         f"{blocker.get('path', [''])[-1]} ({_blocked_cause(blocker)})"
                     )
             if entries:
@@ -210,12 +248,13 @@ def _answer_graph_state(result: dict, message: str) -> str:
         stats = project.get("stats") or {}
         milestones = project.get("milestones") or []
         states = ", ".join(
-            f"{milestone.get('name')} {milestone.get('status')}" for milestone in milestones
+            f"{milestone.get('name')} [{milestone.get('id')}] {milestone.get('status')}"
+            for milestone in milestones
         )
         lines.append(
-            f"{project.get('name')}: {stats.get('done')}/{stats.get('milestones')} done, "
-            f"{stats.get('blocked')} blocked, {stats.get('paid_cents')} of "
-            f"{stats.get('total_cents')} cents paid. {states}."
+            f"{project.get('name')} [{project.get('id')}]: {stats.get('done')}/"
+            f"{stats.get('milestones')} done, {stats.get('blocked')} blocked, "
+            f"{stats.get('paid_cents')} of {stats.get('total_cents')} cents paid. {states}."
         )
     return " ".join(lines) or "The graph has no projects."
 
@@ -229,7 +268,7 @@ def _answer_similar(result: dict) -> str:
     for row in work:
         rows.append(
             f"{row.get('party')} on {row.get('project')}, {row.get('milestone')}, "
-            f"invoice {row.get('invoice')}, {row.get('amount_cents')} cents"
+            f"invoice [{row.get('invoice')}], {row.get('amount_cents')} cents"
         )
     return f"Paid work for {skill}: " + "; ".join(rows) + "."
 
@@ -255,8 +294,8 @@ def _answer_plan(result: dict) -> str:
         f"{' -> '.join(names)}. "
         f"Dependencies: {', '.join(dependencies) if dependencies else 'none'}. "
         f"No amounts are proposed.{similar_text} "
-        "This is a draft only, so the graph did not change. Accepting a plan is not "
-        "available in this milestone."
+        "This is a draft only, so the graph did not change. Ask me to accept it and confirm "
+        "the dialog when you are ready."
     )
 
 
@@ -266,8 +305,44 @@ def _answer_draft(result: dict) -> str:
     names = [str(milestone.get("name")) for milestone in draft.get("milestones") or []]
     return (
         f"Saved a draft plan for {draft.get('projectName') or 'a new project'} in this tab: "
-        f"{' -> '.join(names)}. The graph did not change. Use the project page to record "
-        "sample payments; accepting a plan is not available in this milestone."
+        f"{' -> '.join(names)}. The graph did not change. Ask me to accept it and confirm "
+        "the dialog when you are ready."
+    )
+
+
+def _answer_decline(result: dict) -> str:
+    invoice = result.get("invoice") or {}
+    blocked = result.get("blocked") or []
+    if not blocked:
+        return f"Invoice [{invoice.get('number')}] has no downstream milestones waiting on it."
+    rows = [
+        f"{row.get('blocked')} [{row.get('blocked_id')}] {row.get('status')}"
+        for row in blocked
+    ]
+    return (
+        f"Until invoice [{invoice.get('number')}] for {invoice.get('amount_cents')} cents is "
+        f"paid, these milestones stay blocked: " + "; ".join(rows) + "."
+    )
+
+
+def _answer_accept(result: dict) -> str:
+    project = (result.get("project") or {}).get("project") or {}
+    ids = result.get("node_ids") or {}
+    milestones = ", ".join(ids.get("milestones") or [])
+    return (
+        f"Accepted the plan and created {project.get('name')} [{project.get('id')}]. "
+        f"Milestone ids: {milestones}. The graph changed; no real money moved."
+    )
+
+
+def _answer_payment(result: dict) -> str:
+    unlocked = ", ".join(
+        f"{item.get('name')} [{item.get('id')}]" for item in result.get("unlocked") or []
+    )
+    return (
+        f"Recorded sample payment [{result.get('payment_id')}] for invoice "
+        f"[{result.get('invoice_id')}] at {result.get('amount_cents')} cents. "
+        f"Unlocked: {unlocked or 'nothing'}. No real money moved."
     )
 
 
@@ -289,12 +364,18 @@ def _answer_from_tool(receipt: dict, message: str) -> str:
     action = str(receipt.get("action") or "")
     if action.endswith("get_graph_state"):
         return _answer_graph_state(result, message)
+    if action.endswith("get_decline_path"):
+        return _answer_decline(result)
     if action.endswith("search_similar_work"):
         return _answer_similar(result)
     if action.endswith("propose_plan"):
         return _answer_plan(result)
     if action.endswith("fill_draft"):
         return _answer_draft(result)
+    if action.endswith("accept_plan"):
+        return _answer_accept(result)
+    if action.endswith("record_payment"):
+        return _answer_payment(result)
     return "The site returned data I do not know how to present, so I will not guess."
 
 
@@ -309,8 +390,35 @@ def demo_reply(payload: dict) -> dict:
         receipt = _receipt(tool_messages[-1].get("content"))
         if receipt is None:
             content = "I could not read the tool result, so I will not guess."
-        else:
-            content = _answer_from_tool(receipt, user)
+            return {"content": content, "tool_call": None, "model": MODEL}
+        action = str(receipt.get("action") or "")
+        if action.endswith("get_graph_state") and re.search(
+            r"\brecord\b", user.lower()
+        ) and "payment" in user.lower():
+            result = receipt.get("result") or {}
+            invoice = _find_invoice(result, _invoice_number(user))
+            if invoice is None:
+                return {
+                    "content": (
+                        "I could not find an open invoice with that number, so nothing changed. "
+                        "Ask for a project or invoice from the graph first."
+                    ),
+                    "tool_call": None,
+                    "model": MODEL,
+                }
+            return {
+                "content": "",
+                "tool_call": {
+                    "id": "call_demo_payment",
+                    "name": "website_record_payment",
+                    "arguments": {
+                        "invoiceId": invoice.get("id"),
+                        "amountCents": invoice.get("amount_cents"),
+                    },
+                },
+                "model": MODEL,
+            }
+        content = _answer_from_tool(receipt, user)
         return {"content": content, "tool_call": None, "model": MODEL}
 
     refusal = _refusal(user)

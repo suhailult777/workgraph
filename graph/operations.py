@@ -7,6 +7,7 @@ write failure leaves the graph exactly as it was.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import uuid
 from collections import deque
@@ -49,6 +50,14 @@ def _new_id(prefix: str) -> str:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+PLAN_TEMPLATE = [
+    {"name": "Scope", "depends_on": []},
+    {"name": "Design", "depends_on": ["Scope"]},
+    {"name": "Build", "depends_on": ["Design"]},
+    {"name": "Handover", "depends_on": ["Build"]},
+]
 
 
 def _invoice_status(conn, milestone_id: str) -> str | None:
@@ -749,6 +758,201 @@ def _deliverable_rows(conn, milestone_id: str) -> list[dict]:
     )
 
 
+def accept_plan(conn, project_name: str, milestones: list[dict] | None = None) -> dict:
+    """Accept the sample four-step plan and create the project in one transaction.
+
+    The draft has no amounts. Only the known sample template is accepted, so the
+    server assigns the sample amounts and invoices instead of trusting a model.
+    """
+    assert_store_integrity(conn)
+    plan = milestones if milestones is not None else PLAN_TEMPLATE
+    if not isinstance(plan, list) or len(plan) != len(PLAN_TEMPLATE):
+        raise GraphError(
+            "unsupported_plan",
+            "This sample accepts the four-step Scope, Design, Build, Handover plan only.",
+            422,
+        )
+    for expected, candidate in zip(PLAN_TEMPLATE, plan):
+        if not isinstance(candidate, dict):
+            raise GraphError("unsupported_plan", "Each plan step must be an object.", 422)
+        if candidate.get("name") != expected["name"]:
+            raise GraphError(
+                "unsupported_plan",
+                f"Step {expected['name']} is required; got {candidate.get('name')!r}.",
+                422,
+            )
+        if list(candidate.get("depends_on") or []) != expected["depends_on"]:
+            raise GraphError(
+                "unsupported_plan",
+                f"{expected['name']} must depend on {expected['depends_on'] or 'nothing'}.",
+                422,
+            )
+
+    detail = create_sample_project(conn, project_name)
+    return {
+        "accepted": True,
+        "plan": PLAN_TEMPLATE,
+        "project": detail,
+        "node_ids": {
+            "project": detail["project"]["id"],
+            "milestones": [milestone["id"] for milestone in detail["milestones"]],
+            "invoices": [invoice["id"] for invoice in detail["invoices"]],
+        },
+        "note": (
+            "The graph now has the four sample milestones, their dependencies, the paid "
+            "scope invoice and one open invoice. No real money moved."
+        ),
+    }
+
+
+def decline_path(conn, invoice_number: str) -> dict:
+    """Return every milestone that stays blocked until this invoice is paid."""
+    assert_store_integrity(conn)
+    rows = _fetch(
+        conn,
+        "MATCH (i:Invoice {number: $number})<-[:INVOICED]-(m:Milestone)"
+        "<-[:HAS_MILESTONE]-(p:Project) "
+        "RETURN i.id AS invoice_id, i.number AS number, i.status AS status, "
+        "i.amount_cents AS amount_cents, m.id AS milestone_id, m.name AS milestone, "
+        "p.id AS project_id, p.name AS project",
+        {"number": invoice_number},
+    )
+    if not rows:
+        raise GraphError("not_found", f"Invoice {invoice_number} was not found.", 404)
+    invoice = rows[0]
+    blocked_rows = _fetch(
+        conn,
+        "MATCH (later:Milestone)-[:DEPENDS_ON*1..12]->(m:Milestone {id: $id}) "
+        "RETURN DISTINCT later.id AS blocked_id, later.name AS blocked, "
+        "later.status AS status, later.order AS sort_order "
+        "ORDER BY sort_order, blocked",
+        {"id": invoice["milestone_id"]},
+    )
+    return {
+        "invoice": {
+            "id": invoice["invoice_id"],
+            "number": invoice["number"],
+            "status": invoice["status"],
+            "amount_cents": invoice["amount_cents"],
+        },
+        "milestone": {"id": invoice["milestone_id"], "name": invoice["milestone"]},
+        "project": {"id": invoice["project_id"], "name": invoice["project"]},
+        "blocked": [
+            {
+                "blocked_id": row["blocked_id"],
+                "blocked": row["blocked"],
+                "status": row["status"],
+                "reason": "unpaid_invoice",
+            }
+            for row in blocked_rows
+        ],
+        "blocked_count": len(blocked_rows),
+    }
+
+
+def consume_assistant_quota(
+    conn, ip: str, day: str, ip_cap: int, global_cap: int
+) -> dict:
+    """Consume one assistant call from the per-IP and global daily counters.
+
+    Counters are graph nodes, so they survive a process restart and follow the
+    same durable store as the rest of WorkGraph. The raw IP is never stored.
+    """
+    digest = hashlib.sha256(ip.encode("utf-8")).hexdigest()[:16]
+    ip_id = f"quota-{day}-{digest}"
+    global_id = f"quota-global-{day}"
+    with transaction(conn):
+        ip_rows = _fetch(
+            conn, "MATCH (q:AssistantQuota {id: $id}) RETURN q.count AS count", {"id": ip_id}
+        )
+        global_rows = _fetch(
+            conn,
+            "MATCH (q:AssistantQuota {id: $id}) RETURN q.count AS count",
+            {"id": global_id},
+        )
+        ip_count = ip_rows[0]["count"] if ip_rows else 0
+        global_count = global_rows[0]["count"] if global_rows else 0
+        if ip_count >= ip_cap:
+            return {"allowed": False, "reason": "ip_daily_cap"}
+        if global_count >= global_cap:
+            return {"allowed": False, "reason": "global_daily_cap"}
+
+        if ip_rows:
+            conn.execute(
+                "MATCH (q:AssistantQuota {id: $id}) SET q.count = $count",
+                {"id": ip_id, "count": ip_count + 1},
+            )
+        else:
+            conn.execute(
+                "CREATE (:AssistantQuota {id: $id, day: $day, count: 1})",
+                {"id": ip_id, "day": day},
+            )
+        if global_rows:
+            conn.execute(
+                "MATCH (q:AssistantQuota {id: $id}) SET q.count = $count",
+                {"id": global_id, "count": global_count + 1},
+            )
+        else:
+            conn.execute(
+                "CREATE (:AssistantQuota {id: $id, day: $day, count: 1})",
+                {"id": global_id, "day": day},
+            )
+    return {
+        "allowed": True,
+        "ip_remaining": max(0, ip_cap - (ip_count + 1)),
+        "global_remaining": max(0, global_cap - (global_count + 1)),
+    }
+
+
+def create_paypal_order_record(
+    conn,
+    order_id: str,
+    invoice_id: str,
+    amount_cents: int,
+    currency: str,
+    approve_url: str,
+) -> dict:
+    with transaction(conn):
+        conn.execute(
+            "CREATE (:PayPalOrder {id: $id, invoice_id: $invoice, amount_cents: $amount, "
+            "currency: $currency, status: 'CREATED', approve_url: $approve, "
+            "created_at: $at})",
+            {
+                "id": order_id,
+                "invoice": invoice_id,
+                "amount": amount_cents,
+                "currency": currency,
+                "approve": approve_url,
+                "at": _now(),
+            },
+        )
+    return get_paypal_order_record(conn, order_id)
+
+
+def get_paypal_order_record(conn, order_id: str) -> dict:
+    rows = _fetch(
+        conn,
+        "MATCH (o:PayPalOrder {id: $id}) RETURN o.id AS id, o.invoice_id AS invoice_id, "
+        "o.amount_cents AS amount_cents, o.currency AS currency, o.status AS status, "
+        "o.approve_url AS approve_url, o.payment_id AS payment_id, "
+        "o.capture_id AS capture_id, o.created_at AS created_at",
+        {"id": order_id},
+    )
+    if not rows:
+        raise GraphError("not_found", f"PayPal order {order_id} was not found.", 404)
+    return rows[0]
+
+
+def mark_paypal_order_captured(conn, order_id: str, payment_id: str, capture_id: str) -> dict:
+    with transaction(conn):
+        conn.execute(
+            "MATCH (o:PayPalOrder {id: $id}) SET o.status = 'CAPTURED', "
+            "o.payment_id = $payment, o.capture_id = $capture, o.captured_at = $at",
+            {"id": order_id, "payment": payment_id, "capture": capture_id, "at": _now()},
+        )
+    return get_paypal_order_record(conn, order_id)
+
+
 def preview_payment(conn, invoice_id: str) -> dict:
     assert_store_integrity(conn)
     row = _invoice_row(conn, invoice_id)
@@ -805,7 +1009,13 @@ def preview_payment(conn, invoice_id: str) -> dict:
     }
 
 
-def record_payment(conn, invoice_id: str, amount_cents: int) -> dict:
+def record_payment(
+    conn,
+    invoice_id: str,
+    amount_cents: int,
+    method: str = "sample",
+    external_id: str | None = None,
+) -> dict:
     if (
         not isinstance(amount_cents, int)
         or isinstance(amount_cents, bool)
@@ -829,9 +1039,15 @@ def record_payment(conn, invoice_id: str, amount_cents: int) -> dict:
             {"id": invoice_id},
         )
         conn.execute(
-            "CREATE (:Payment {id: $id, amount_cents: $amount, method: 'sample', "
-            "recorded_at: $at})",
-            {"id": payment_id, "amount": amount_cents, "at": _now()},
+            "CREATE (:Payment {id: $id, amount_cents: $amount, method: $method, "
+            "external_id: $external, recorded_at: $at})",
+            {
+                "id": payment_id,
+                "amount": amount_cents,
+                "method": method,
+                "external": external_id,
+                "at": _now(),
+            },
         )
         conn.execute(
             "MATCH (i:Invoice {id: $invoice}), (p:Payment {id: $payment}) "

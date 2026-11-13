@@ -5,9 +5,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from backend.app import create_app
+from backend.assistant import AssistantService
+from backend.paypal import PayPalClient
 from graph.db import connect
+from graph.operations import PLAN_TEMPLATE, consume_assistant_quota
 from graph.seed import seed
-
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -222,10 +224,14 @@ def test_manifest(client):
     assert manifest["actions"]["agentTools"] == [
         "get_graph_state",
         "search_similar_work",
+        "get_decline_path",
         "propose_plan",
         "fill_draft",
+        "accept_plan",
+        "record_payment",
     ]
-    assert manifest["llm_router"]["mock"] is True
+    assert manifest["llm_router"]["mock"] is False
+    assert manifest["llm_router"]["base_url"] == "/api/assistant"
 
 
 def test_network_is_resolved_json(client):
@@ -291,22 +297,28 @@ def test_same_origin_write_is_allowed(client):
     assert response.json()["project"]["name"] == "Same origin"
 
 
-def test_write_requires_a_local_host_even_with_a_matching_origin(client):
+def test_write_accepts_a_public_same_origin(client):
     response = client.post(
         "/api/projects",
-        json={"name": "DNS rebinding"},
-        headers={"Host": "evil.example", "Origin": "http://evil.example"},
+        json={"name": "Public origin"},
+        headers={
+            "Host": "workgraph.example",
+            "Origin": "https://workgraph.example",
+            "X-Forwarded-Proto": "https",
+        },
     )
-    assert response.status_code == 403
-    assert response.json()["detail"]["code"] == "host_not_allowed"
+    assert response.status_code == 201
+    assert response.json()["project"]["name"] == "Public origin"
 
+
+def test_write_refuses_an_origin_with_a_different_host(client):
     response = client.post(
         "/api/projects",
-        json={"name": "No origin"},
-        headers={"Host": "evil.example"},
+        json={"name": "Wrong host"},
+        headers={"Host": "workgraph.example", "Origin": "https://evil.example"},
     )
     assert response.status_code == 403
-    assert response.json()["detail"]["code"] == "host_not_allowed"
+    assert response.json()["detail"]["code"] == "cross_origin_write"
 
 
 def test_demo_router_returns_an_sse_tool_call(client):
@@ -370,3 +382,154 @@ def test_frontend_build_is_served(client):
     assert response.status_code == 200
     assert "text/html" in response.headers["content-type"]
     assert "<div id=\"root\">" in response.text
+
+def test_config_reports_booleans_without_secrets(client):
+    body = client.get("/api/config").json()
+    assert set(body) == {
+        "assistant_live",
+        "paypal_sandbox_configured",
+        "storage_kind",
+        "environment",
+    }
+    assert isinstance(body["assistant_live"], bool)
+    assert isinstance(body["paypal_sandbox_configured"], bool)
+    assert body["storage_kind"] == "local_file"
+    assert "secret" not in json.dumps(body).lower()
+    assert "key" not in json.dumps(body).lower()
+
+
+def test_accept_plan_endpoint_writes_the_project(client):
+    response = client.post(
+        "/api/plans/accept",
+        json={"project_name": "Accepted brand", "milestones": PLAN_TEMPLATE},
+    )
+    assert response.status_code == 201
+    body = response.json()
+    assert body["accepted"] is True
+    assert body["project"]["project"]["name"] == "Accepted brand"
+    assert len(body["node_ids"]["milestones"]) == 4
+
+    project = client.get(f"/api/projects/{body['node_ids']['project']}").json()
+    assert project["project"]["name"] == "Accepted brand"
+    assert len(project["milestones"]) == 4
+
+
+def test_decline_path_endpoint_lists_waiting_milestones(client):
+    body = client.get("/api/graph/decline-path", params={"invoice": "WG-1002"}).json()
+    assert body["invoice"]["number"] == "WG-1002"
+    assert [row["blocked"] for row in body["blocked"]] == ["Build", "Handover"]
+    assert body["blocked_count"] == 2
+
+
+def test_assistant_endpoint_reports_quota_and_returns_sse(tmp_path):
+    path = tmp_path / "workgraph.rl"
+    with connect(path) as conn:
+        seed(conn)
+        conn.flush()
+    app = create_app(path)
+    app.state.assistant = AssistantService(
+        mock=True,
+        ip_cap=1,
+        global_cap=2,
+        quota=lambda ip, day, ip_cap, global_cap: app.state.graph.call(
+            lambda conn: consume_assistant_quota(conn, ip, day, ip_cap, global_cap)
+        ),
+    )
+    with TestClient(app) as client:
+        first = client.post(
+            "/api/assistant/chat/completions",
+            json={"messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert first.status_code == 200
+        assert first.headers["content-type"].startswith("text/event-stream")
+        assert first.headers["x-nsdeploy-llm-route"] == "live"
+        assert "data: [DONE]" in first.text
+
+        second = client.post(
+            "/api/assistant",
+            json={"messages": [{"role": "user", "content": "hi again"}]},
+        )
+        assert second.status_code == 429
+        assert second.json()["detail"]["code"] == "quota_exhausted"
+
+
+def test_paypal_mock_flow_creates_captures_and_is_idempotent(tmp_path):
+    path = tmp_path / "workgraph.rl"
+    with connect(path) as conn:
+        seed(conn)
+        conn.flush()
+    app = create_app(path, paypal=PayPalClient(mock=True))
+    with TestClient(app) as client:
+        created = client.post("/api/paypal/orders", json={"invoice_id": "inv-h2"})
+        assert created.status_code == 201
+        body = created.json()
+        assert body["order"]["mock"] is True
+        assert body["order"]["amount_cents"] == 240000
+        assert body["approve_url"].startswith("/#/mock-paypal")
+        order_id = body["order"]["id"]
+
+        captured = client.post(f"/api/paypal/orders/{order_id}/capture")
+        assert captured.status_code == 200
+        result = captured.json()
+        assert result["already_captured"] is False
+        assert result["payment"]["amount_cents"] == 240000
+        payment_id = result["payment"]["payment_id"]
+
+        again = client.post(f"/api/paypal/orders/{order_id}/capture")
+        assert again.status_code == 200
+        assert again.json()["already_captured"] is True
+        assert again.json()["payment_id"] == payment_id
+
+        project = client.get("/api/projects/proj-harbour").json()
+        invoice = next(invoice for invoice in project["invoices"] if invoice["id"] == "inv-h2")
+        assert invoice["status"] == "PAID"
+        assert any(payment["id"] == payment_id for payment in project["payments"])
+
+
+def test_paypal_webhook_without_an_id_is_skipped(client):
+    response = client.post(
+        "/api/paypal/webhook",
+        content=json.dumps({"event_type": "PAYMENT.CAPTURE.COMPLETED"}),
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 200
+    assert response.json()["skipped"] == "webhook_id_not_configured"
+
+def test_paypal_webhook_records_a_capture_once(tmp_path):
+    path = tmp_path / "workgraph.rl"
+    with connect(path) as conn:
+        seed(conn)
+        conn.flush()
+    app = create_app(path, paypal=PayPalClient(mock=True, webhook_id="WH-1"))
+    with TestClient(app) as client:
+        created = client.post("/api/paypal/orders", json={"invoice_id": "inv-h2"}).json()
+        order_id = created["order"]["id"]
+        event = {
+            "event_type": "PAYMENT.CAPTURE.COMPLETED",
+            "resource": {
+                "id": "CAP-1",
+                "supplementary_data": {"related_ids": {"order_id": order_id}},
+            },
+        }
+        first = client.post(
+            "/api/paypal/webhook",
+            content=json.dumps(event),
+            headers={"Content-Type": "application/json"},
+        )
+        assert first.status_code == 200
+        assert first.json()["already_captured"] is False
+
+        second = client.post(
+            "/api/paypal/webhook",
+            content=json.dumps(event),
+            headers={"Content-Type": "application/json"},
+        )
+        assert second.status_code == 200
+        assert second.json()["already_captured"] is True
+
+def test_assistant_models_lists_only_free_ids(client):
+    body = client.get("/api/assistant/models").json()
+    ids = [item["id"] for item in body["data"]]
+    assert ids
+    assert all(model.endswith(":free") for model in ids)
+    assert "OPENROUTER_API_KEY" not in json.dumps(body)

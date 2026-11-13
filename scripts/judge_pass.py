@@ -18,9 +18,11 @@ BASE = "http://127.0.0.1:8090"
 
 CHECKS = [
     ("/api/health", "application/json", "ok"),
+    ("/api/config", "application/json", "assistant_live"),
     ("/api/projects", "application/json", "Harbour rebrand"),
     ("/api/projects/proj-harbour", "application/json", "Design system"),
     ("/api/graph/state", "application/json", "Harbour rebrand"),
+    ("/api/graph/decline-path?invoice=WG-1002", "application/json", "blocked_count"),
     ("/agent-manifest.json", "application/json", "workgraph"),
     ("/workgraph.network.json", "application/json", "workgraph_coordinator"),
     ("/links.json", "application/json", "networks"),
@@ -28,7 +30,7 @@ CHECKS = [
     ("/.well-known/nsdeploy.json", "application/json", "protocol"),
     ("/runtime/index.js", "javascript", "export"),
     ("/runtime/generated/graph.gen.mjs", "javascript", "export"),
-    ("/site-actions.js", "javascript", "registerActions"),
+    ("/site-actions.js", "javascript", "accept_plan"),
     ("/page-bridge.js", "javascript", "WorkGraphPage"),
     ("/", "text/html", "WorkGraph"),
 ]

@@ -4,28 +4,39 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Callable, TypeVar
+from urllib.parse import urlsplit
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import relate
 
+from backend.assistant import AssistantError, AssistantService, completion_to_sse
 from backend.demo_llm import demo_reply
+from backend.paypal import PayPalClient, PayPalError, verify_capture
+from backend.storage import BlobStorage, LocalStorage, StorageError, build_storage
 from graph.db import DEFAULT_STORE, connect
 from graph.operations import (
     GraphError,
+    accept_plan,
     agent_state,
     assert_store_integrity,
     complete_milestone,
+    consume_assistant_quota,
+    create_paypal_order_record,
     create_sample_project,
+    decline_path,
+    get_paypal_order_record,
     get_project,
     list_projects,
+    mark_paypal_order_captured,
     preview_payment,
     record_payment,
 )
@@ -46,6 +57,35 @@ class PaymentCreate(BaseModel):
     amount_cents: int = Field(gt=0)
 
 
+class PlanStep(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    depends_on: list[str] = Field(default_factory=list)
+
+
+class PlanAccept(BaseModel):
+    project_name: str = Field(min_length=1, max_length=80)
+    milestones: list[PlanStep]
+
+
+class PayPalOrderCreate(BaseModel):
+    invoice_id: str = Field(min_length=1, max_length=80)
+    return_url: str | None = Field(default=None, max_length=500)
+    cancel_url: str | None = Field(default=None, max_length=500)
+
+
+def _is_production() -> bool:
+    return os.environ.get("WORKGRAPH_ENV", "").lower() == "production" or bool(
+        os.environ.get("VERCEL")
+    )
+
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip() or "unknown"
+    return request.client.host if request.client else "unknown"
+
+
 class GraphService:
     """Owns one Relate connection on a dedicated thread.
 
@@ -54,8 +94,9 @@ class GraphService:
     thread, and the single connection means a write is visible to the next read.
     """
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, storage: LocalStorage | BlobStorage | None = None):
         self.path = path
+        self.storage = storage or LocalStorage()
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="relate")
         self._conn = None
 
@@ -82,6 +123,23 @@ class GraphService:
 
     def query(self, cypher: str, params: dict | None = None) -> list[dict]:
         return self.call(lambda conn: rows(conn, cypher, params))
+
+    def _persist(self) -> None:
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
+        self.storage.save_from(self.path)
+
+    def persist(self) -> None:
+        if self.storage.kind == "local_file":
+            return
+        try:
+            self._pool.submit(self._persist).result(timeout=60)
+        except StorageError as exc:
+            raise HTTPException(
+                status_code=exc.status,
+                detail={"code": exc.code, "message": exc.message},
+            ) from exc
 
     def close(self) -> None:
         if self._conn is not None:
@@ -124,9 +182,35 @@ def _store_label(path: Path) -> str:
     return path.name
 
 
-def create_app(store: Path | None = None) -> FastAPI:
+def create_app(
+    store: Path | None = None,
+    *,
+    storage: LocalStorage | BlobStorage | None = None,
+    assistant: AssistantService | None = None,
+    paypal: PayPalClient | None = None,
+) -> FastAPI:
     path = Path(store) if store else Path(os.environ.get("WORKGRAPH_STORE", DEFAULT_STORE))
-    graph = GraphService(path)
+    selected_storage = storage or build_storage()
+    if selected_storage.kind != "local_file":
+        try:
+            selected_storage.load_to(path)
+        except StorageError:
+            if DEFAULT_STORE.exists():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(DEFAULT_STORE, path)
+                selected_storage.save_from(path)
+            else:
+                raise
+    graph = GraphService(path, selected_storage)
+    assistant_service = assistant or AssistantService(
+        mock=bool(os.environ.get("WORKGRAPH_ASSISTANT_MOCK") == "1" and not _is_production()),
+        quota=lambda ip, day, ip_cap, global_cap: graph.call(
+            lambda conn: consume_assistant_quota(conn, ip, day, ip_cap, global_cap)
+        ),
+    )
+    paypal_client = paypal or PayPalClient(
+        mock=bool(os.environ.get("PAYPAL_MOCK") == "1" and not _is_production())
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -145,38 +229,38 @@ def create_app(store: Path | None = None) -> FastAPI:
     @app.middleware("http")
     async def same_origin_writes(request, call_next):
         if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
-            host = (request.url.hostname or "").lower().rstrip(".")
-            if host.startswith("[") and host.endswith("]"):
-                host = host[1:-1]
-            allowed_host = host in {"localhost", "::1", "0.0.0.0", "testserver"} or host.startswith(
-                "127."
-            )
-            if not allowed_host:
-                return JSONResponse(
-                    status_code=403,
-                    content={
-                        "detail": {
-                            "code": "host_not_allowed",
-                            "message": "WorkGraph sample writes are local-host only.",
-                        }
-                    },
-                )
             origin = request.headers.get("origin")
-            if origin and origin.rstrip("/") != str(request.base_url).rstrip("/"):
-                return JSONResponse(
-                    status_code=403,
-                    content={
-                        "detail": {
-                            "code": "cross_origin_write",
-                            "message": "WorkGraph sample writes are same-origin only.",
-                        }
-                    },
+            if origin:
+                parsed = urlsplit(origin)
+                expected_host = request.headers.get("host", "")
+                expected_scheme = request.headers.get(
+                    "x-forwarded-proto", request.url.scheme
                 )
+                if parsed.netloc != expected_host or parsed.scheme != expected_scheme:
+                    return JSONResponse(
+                        status_code=403,
+                        content={
+                            "detail": {
+                                "code": "cross_origin_write",
+                                "message": "WorkGraph writes are same-origin only.",
+                            }
+                        },
+                    )
         return await call_next(request)
     app.state.graph = graph
+    app.state.storage = selected_storage
+    app.state.assistant = assistant_service
+    app.state.paypal = paypal_client
 
     @app.exception_handler(GraphError)
     async def graph_error(_request, exc: GraphError) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.status,
+            content={"detail": {"code": exc.code, "message": exc.message}},
+        )
+
+    @app.exception_handler(PayPalError)
+    async def paypal_error(_request, exc: PayPalError) -> JSONResponse:
         return JSONResponse(
             status_code=exc.status,
             content={"detail": {"code": exc.code, "message": exc.message}},
@@ -195,6 +279,18 @@ def create_app(store: Path | None = None) -> FastAPI:
             "service": "workgraph",
             "store": _store_label(path),
             "graph_ready": ready,
+            "assistant_live": assistant_service.configured,
+            "paypal_sandbox_configured": paypal_client.configured,
+            "storage_kind": selected_storage.kind,
+        }
+
+    @app.get("/api/config")
+    def config() -> dict:
+        return {
+            "assistant_live": assistant_service.configured,
+            "paypal_sandbox_configured": paypal_client.configured,
+            "storage_kind": selected_storage.kind,
+            "environment": "production" if _is_production() else "development",
         }
 
     @app.get("/api/projects")
@@ -204,7 +300,21 @@ def create_app(store: Path | None = None) -> FastAPI:
     @app.post("/api/projects", status_code=201)
     def create_project(body: ProjectCreate | None = None) -> dict:
         name = body.name if body else None
-        return graph.call(lambda conn: create_sample_project(conn, name))
+        result = graph.call(lambda conn: create_sample_project(conn, name))
+        graph.persist()
+        return result
+
+    @app.post("/api/plans/accept", status_code=201)
+    def accept(body: PlanAccept) -> dict:
+        result = graph.call(
+            lambda conn: accept_plan(
+                conn,
+                body.project_name,
+                [step.model_dump() for step in body.milestones],
+            )
+        )
+        graph.persist()
+        return result
 
     @app.get("/api/projects/{project_id}")
     def project(project_id: str) -> dict:
@@ -216,13 +326,17 @@ def create_app(store: Path | None = None) -> FastAPI:
 
     @app.post("/api/payments", status_code=201)
     def payment(body: PaymentCreate) -> dict:
-        return graph.call(
+        result = graph.call(
             lambda conn: record_payment(conn, body.invoice_id, body.amount_cents)
         )
+        graph.persist()
+        return result
 
     @app.post("/api/milestones/{milestone_id}/complete")
     def milestone_complete(milestone_id: str) -> dict:
-        return graph.call(lambda conn: complete_milestone(conn, milestone_id))
+        result = graph.call(lambda conn: complete_milestone(conn, milestone_id))
+        graph.persist()
+        return result
 
     @app.get("/api/graph/summary")
     def summary() -> dict:
@@ -265,9 +379,177 @@ def create_app(store: Path | None = None) -> FastAPI:
 
         return {"skill": skill, "work": graph.call(read_similar)}
 
+    @app.get("/api/graph/decline-path")
+    def graph_decline_path(invoice: str = Query(min_length=1, max_length=40)) -> dict:
+        return graph.call(lambda conn: decline_path(conn, invoice))
+
     @app.get("/api/graph/unlocks")
     def unlocks() -> dict:
         return {"unlocks": graph.query(UNLOCK_PATHS)}
+
+    @app.get("/api/assistant/models")
+    def assistant_models() -> dict:
+        return {
+            "object": "list",
+            "data": [
+                {"id": model, "object": "model", "owned_by": "openrouter"}
+                for model in app.state.assistant.models
+            ],
+        }
+
+    @app.post("/api/assistant")
+    def assistant_chat(payload: dict, request: Request) -> JSONResponse:
+        try:
+            completion = app.state.assistant.chat(payload, _client_ip(request))
+        except AssistantError as exc:
+            return JSONResponse(
+                status_code=exc.status,
+                content={"detail": {"code": exc.code, "message": exc.message}},
+            )
+        return JSONResponse(completion)
+
+    @app.post("/api/assistant/chat/completions", include_in_schema=False)
+    def assistant_completions(payload: dict, request: Request) -> Response:
+        try:
+            completion = app.state.assistant.chat(payload, _client_ip(request))
+        except AssistantError as exc:
+            return Response(
+                content=exc.message,
+                status_code=exc.status,
+                media_type="text/plain",
+                headers={"X-WorkGraph-Error": exc.code},
+            )
+        return Response(
+            content=completion_to_sse(completion),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Nsdeploy-LLM-Route": "live",
+            },
+        )
+
+    def capture_paypal_order(order_id: str) -> dict:
+        record = graph.call(lambda conn: get_paypal_order_record(conn, order_id))
+        if record["status"] == "CAPTURED":
+            return {
+                "already_captured": True,
+                "order": record,
+                "payment_id": record.get("payment_id"),
+            }
+        if not paypal_client.configured:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "paypal_not_configured",
+                    "message": "PayPal sandbox is not configured on this deployment.",
+                },
+            )
+        preview = graph.call(lambda conn: preview_payment(conn, record["invoice_id"]))
+        captured = paypal_client.capture_order(
+            order_id, record["amount_cents"], record["currency"]
+        )
+        capture_id = verify_capture(
+            captured, order_id, record["amount_cents"], record["currency"]
+        )
+        payment = graph.call(
+            lambda conn: record_payment(
+                conn,
+                record["invoice_id"],
+                record["amount_cents"],
+                method="paypal_sandbox",
+                external_id=order_id,
+            )
+        )
+        order = graph.call(
+            lambda conn: mark_paypal_order_captured(
+                conn, order_id, payment["payment_id"], capture_id
+            )
+        )
+        graph.persist()
+        return {
+            "already_captured": False,
+            "order": order,
+            "capture_id": capture_id,
+            "payment": payment,
+            "invoice": preview["invoice"],
+        }
+
+    @app.post("/api/paypal/orders", status_code=201)
+    def paypal_create_order(body: PayPalOrderCreate, request: Request) -> dict:
+        if not paypal_client.configured:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "paypal_not_configured",
+                    "message": "PayPal sandbox is not configured on this deployment.",
+                },
+            )
+        preview = graph.call(lambda conn: preview_payment(conn, body.invoice_id))
+        base = str(request.base_url).rstrip("/")
+        order = paypal_client.create_order(
+            preview["amount_cents"],
+            "USD",
+            body.invoice_id,
+            body.return_url or f"{base}/#/projects/{preview['project']['id']}",
+            body.cancel_url or f"{base}/#/projects/{preview['project']['id']}",
+        )
+        record = graph.call(
+            lambda conn: create_paypal_order_record(
+                conn,
+                order["id"],
+                body.invoice_id,
+                preview["amount_cents"],
+                "USD",
+                order["approve_url"],
+            )
+        )
+        graph.persist()
+        return {
+            "order": {**record, "mock": bool(order.get("mock"))},
+            "approve_url": order["approve_url"],
+            "invoice": preview["invoice"],
+            "amount_cents": preview["amount_cents"],
+        }
+
+    @app.post("/api/paypal/orders/{order_id}/capture")
+    def paypal_capture(order_id: str) -> dict:
+        return capture_paypal_order(order_id)
+
+    @app.get("/api/paypal/orders/{order_id}")
+    def paypal_order(order_id: str) -> dict:
+        return {"order": graph.call(lambda conn: get_paypal_order_record(conn, order_id))}
+
+    @app.post("/api/paypal/webhook")
+    async def paypal_webhook(request: Request) -> dict:
+        raw = await request.body()
+        verified = paypal_client.verify_webhook(dict(request.headers), raw)
+        if verified is None:
+            return {"ok": True, "skipped": "webhook_id_not_configured"}
+        if not verified:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "paypal_webhook_invalid", "message": "Webhook verification failed."},
+            )
+        try:
+            event = json.loads(raw)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "paypal_webhook_invalid", "message": "Webhook body is not JSON."},
+            ) from exc
+        if event.get("event_type") != "PAYMENT.CAPTURE.COMPLETED":
+            return {"ok": True, "ignored": event.get("event_type")}
+        resource = event.get("resource") or {}
+        order_id = (
+            (resource.get("supplementary_data") or {}).get("related_ids", {}).get("order_id")
+            or resource.get("id")
+        )
+        if not order_id:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "paypal_webhook_invalid", "message": "Webhook has no order id."},
+            )
+        return capture_paypal_order(order_id)
 
     @app.post("/api/demo/llm/chat/completions", include_in_schema=False)
     def demo_chat(payload: dict) -> Response:

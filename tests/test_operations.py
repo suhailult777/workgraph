@@ -12,11 +12,18 @@ import pytest
 
 from graph.db import connect
 from graph.operations import (
+    PLAN_TEMPLATE,
     GraphError,
+    accept_plan,
     complete_milestone,
+    consume_assistant_quota,
+    create_paypal_order_record,
     create_sample_project,
+    decline_path,
+    get_paypal_order_record,
     get_project,
     list_projects,
+    mark_paypal_order_captured,
     preview_payment,
     record_payment,
     transaction,
@@ -488,3 +495,108 @@ def test_transaction_rolls_back_partial_writes(conn):
 
     assert counts(conn) == before
     assert conn.execute("MATCH (p:Party {id: 'party-ghost'}) RETURN p").fetchall() == []
+
+def test_accept_plan_creates_the_four_step_template(conn):
+    accepted = accept_plan(conn, "Brand refresh", PLAN_TEMPLATE)
+    project = accepted["project"]
+
+    assert project["project"]["name"] == "Brand refresh"
+    assert [m["name"] for m in project["milestones"]] == ["Scope", "Design", "Build", "Handover"]
+    by_id = {m["id"]: m["name"] for m in project["milestones"]}
+    assert {
+        (by_id[edge["source"]], by_id[edge["target"]]) for edge in project["dependencies"]
+    } == {("Design", "Scope"), ("Build", "Design"), ("Handover", "Build")}
+    assert project["stats"]["paid_cents"] == 120000
+    assert accepted["accepted"] is True
+    assert len(accepted["node_ids"]["milestones"]) == 4
+    assert {edge["type"] for edge in project["graph"]["edges"]} >= {
+        "HAS_MILESTONE",
+        "DEPENDS_ON",
+        "INVOICED",
+        "PAID_BY",
+        "UNLOCKS",
+    }
+
+
+def test_accept_plan_refuses_a_different_plan_without_writing(conn):
+    before = counts(conn)
+    with pytest.raises(GraphError) as error:
+        accept_plan(
+            conn,
+            "Unsupported",
+            [
+                {"name": "Scope", "depends_on": []},
+                {"name": "Launch", "depends_on": ["Scope"]},
+            ],
+        )
+    assert error.value.code == "unsupported_plan"
+    assert counts(conn) == before
+
+
+def test_decline_path_lists_every_milestone_waiting_on_an_invoice(conn):
+    path = decline_path(conn, "WG-1002")
+
+    assert path["invoice"]["number"] == "WG-1002"
+    assert path["invoice"]["amount_cents"] == 240000
+    assert path["milestone"]["id"] == "ms-h2"
+    assert [(row["blocked_id"], row["blocked"]) for row in path["blocked"]] == [
+        ("ms-h3", "Build"),
+        ("ms-h4", "Handover"),
+    ]
+    assert all(row["reason"] == "unpaid_invoice" for row in path["blocked"])
+    assert path["blocked_count"] == 2
+
+
+def test_decline_path_for_an_unknown_invoice_is_not_found(conn):
+    with pytest.raises(GraphError) as error:
+        decline_path(conn, "WG-9999")
+    assert error.value.code == "not_found"
+
+
+def test_assistant_quota_caps_the_ip_and_the_day(conn):
+    day = "2026-11-13"
+    first = consume_assistant_quota(conn, "203.0.113.9", day, 2, 3)
+    second = consume_assistant_quota(conn, "203.0.113.9", day, 2, 3)
+    blocked_ip = consume_assistant_quota(conn, "203.0.113.9", day, 2, 3)
+    other_ip = consume_assistant_quota(conn, "203.0.113.10", day, 2, 3)
+    blocked_global = consume_assistant_quota(conn, "203.0.113.11", day, 2, 3)
+
+    assert first["allowed"] is True and first["ip_remaining"] == 1
+    assert second["allowed"] is True and second["ip_remaining"] == 0
+    assert blocked_ip == {"allowed": False, "reason": "ip_daily_cap"}
+    assert other_ip["allowed"] is True and other_ip["global_remaining"] == 0
+    assert blocked_global == {"allowed": False, "reason": "global_daily_cap"}
+
+
+def test_paypal_order_record_roundtrip(conn):
+    record = create_paypal_order_record(
+        conn,
+        "ORDER-1",
+        "inv-h2",
+        240000,
+        "USD",
+        "https://sandbox.example/approve",
+    )
+    assert record["status"] == "CREATED"
+    assert get_paypal_order_record(conn, "ORDER-1")["invoice_id"] == "inv-h2"
+
+    marked = mark_paypal_order_captured(conn, "ORDER-1", "pay-test", "CAPTURE-1")
+    assert marked["status"] == "CAPTURED"
+    assert marked["payment_id"] == "pay-test"
+    assert marked["capture_id"] == "CAPTURE-1"
+
+
+def test_paypal_payment_records_its_method_and_unlocks_only_the_paid_deliverable(conn):
+    result = record_payment(conn, "inv-h2", 240000, method="paypal_sandbox", external_id="ORDER-1")
+    payment = conn.execute(
+        "MATCH (p:Payment {id: $id}) RETURN p.method AS method, p.external_id AS external_id",
+        {"id": result["payment_id"]},
+    ).fetchone()
+
+    assert payment["method"] == "paypal_sandbox"
+    assert payment["external_id"] == "ORDER-1"
+    assert result["unlocked"] == [{"id": "del-h2", "name": "Design system kit"}]
+    unlocked = unlock_rows(conn)
+    assert [row["deliverable"] for row in unlocked if row["payment"] == result["payment_id"]] == [
+        "del-h2"
+    ]

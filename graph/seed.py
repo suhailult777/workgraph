@@ -25,12 +25,12 @@ PROJECTS = [
 ]
 
 MILESTONES = [
-    {"id": "ms-h1", "name": "Discovery", "project": "proj-harbour", "status": "PAID", "amount_cents": 180000, "skill": "skill-research"},
-    {"id": "ms-h2", "name": "Design system", "project": "proj-harbour", "status": "SENT", "amount_cents": 240000, "skill": "skill-design"},
-    {"id": "ms-h3", "name": "Build", "project": "proj-harbour", "status": "BLOCKED", "amount_cents": 320000, "skill": "skill-build"},
-    {"id": "ms-h4", "name": "Handover", "project": "proj-harbour", "status": "BLOCKED", "amount_cents": 90000, "skill": "skill-build"},
-    {"id": "ms-a1", "name": "Audit", "project": "proj-atlas", "status": "PAID", "amount_cents": 120000, "skill": "skill-research"},
-    {"id": "ms-a2", "name": "Component library", "project": "proj-atlas", "status": "PAID", "amount_cents": 260000, "skill": "skill-design"},
+    {"id": "ms-h1", "name": "Discovery", "project": "proj-harbour", "status": "DONE", "amount_cents": 180000, "skill": "skill-research", "order": 1},
+    {"id": "ms-h2", "name": "Design system", "project": "proj-harbour", "status": "SENT", "amount_cents": 240000, "skill": "skill-design", "order": 2},
+    {"id": "ms-h3", "name": "Build", "project": "proj-harbour", "status": "BLOCKED", "amount_cents": 320000, "skill": "skill-build", "order": 3},
+    {"id": "ms-h4", "name": "Handover", "project": "proj-harbour", "status": "BLOCKED", "amount_cents": 90000, "skill": "skill-build", "order": 4},
+    {"id": "ms-a1", "name": "Audit", "project": "proj-atlas", "status": "DONE", "amount_cents": 120000, "skill": "skill-research", "order": 1},
+    {"id": "ms-a2", "name": "Component library", "project": "proj-atlas", "status": "DONE", "amount_cents": 260000, "skill": "skill-design", "order": 2},
 ]
 
 # Milestone dependency edges, child -> prerequisite.
@@ -56,6 +56,9 @@ PAYMENTS = [
 
 DELIVERABLES = [
     {"id": "del-h1", "name": "Discovery notes", "milestone": "ms-h1", "payment": "pay-h1"},
+    {"id": "del-h2", "name": "Design system kit", "milestone": "ms-h2", "payment": None},
+    {"id": "del-h3", "name": "Build preview", "milestone": "ms-h3", "payment": None},
+    {"id": "del-h4", "name": "Handover pack", "milestone": "ms-h4", "payment": None},
     {"id": "del-a1", "name": "Audit report", "milestone": "ms-a1", "payment": "pay-a1"},
     {"id": "del-a2", "name": "Component library source", "milestone": "ms-a2", "payment": "pay-a2"},
 ]
@@ -91,7 +94,8 @@ def seed(conn) -> dict:
             conn.execute("CREATE (:Project {id: $id, name: $name, status: $status})", p)
         for m in MILESTONES:
             conn.execute(
-                "CREATE (:Milestone {id: $id, name: $name, status: $status, amount_cents: $amount_cents})",
+                "CREATE (:Milestone {id: $id, name: $name, status: $status, "
+                "amount_cents: $amount_cents, order: $order})",
                 m,
             )
         for i in INVOICES:
@@ -152,14 +156,17 @@ def seed(conn) -> dict:
                 "MATCH (m:Milestone {id: $milestone}), (d:Deliverable {id: $did}) CREATE (m)-[:PRODUCES]->(d)",
                 {"milestone": d["milestone"], "did": d["id"]},
             )
-            conn.execute(
-                "MATCH (p:Payment {id: $payment}), (d:Deliverable {id: $did}) CREATE (p)-[:UNLOCKS]->(d)",
-                {"payment": d["payment"], "did": d["id"]},
-            )
+            if d["payment"]:
+                conn.execute(
+                    "MATCH (p:Payment {id: $payment}), (d:Deliverable {id: $did}) CREATE (p)-[:UNLOCKS]->(d)",
+                    {"payment": d["payment"], "did": d["id"]},
+                )
         conn.commit()
     except Exception:
         conn.rollback()
         raise
+    finally:
+        conn.autocommit = True
 
     return counts(conn)
 

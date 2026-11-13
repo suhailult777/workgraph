@@ -24,7 +24,7 @@ def store(tmp_path):
 
 def test_seed_shape(store):
     with connect(store, read_only=True) as conn:
-        assert counts(conn) == {"nodes": 25, "relationships": 37}
+        assert counts(conn) == {"nodes": 28, "relationships": 40}
 
 
 def test_store_survives_process_exit(store):
@@ -37,7 +37,7 @@ def test_store_survives_process_exit(store):
         [sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True, timeout=60
     )
     assert out.returncode == 0, out.stderr
-    assert json.loads(out.stdout) == {"n": 25}
+    assert json.loads(out.stdout) == {"n": 28}
 
 
 def test_blocked_milestones_follow_dependency_chain(store):

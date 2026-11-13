@@ -18,6 +18,8 @@ BASE = "http://127.0.0.1:8090"
 
 CHECKS = [
     ("/api/health", "application/json", "ok"),
+    ("/api/projects", "application/json", "Harbour rebrand"),
+    ("/api/projects/proj-harbour", "application/json", "Design system"),
     ("/agent-manifest.json", "application/json", "workgraph"),
     ("/workgraph.network.json", "application/json", "workgraph_coordinator"),
     ("/links.json", "application/json", "networks"),

@@ -4,9 +4,10 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from backend.app import create_app
+from backend.app import _default_store_path, create_app
 from backend.assistant import AssistantService
 from backend.paypal import PayPalClient
+from backend.storage import StorageError
 from graph.db import connect
 from graph.operations import PLAN_TEMPLATE, consume_assistant_quota
 from graph.seed import seed
@@ -272,6 +273,20 @@ def test_site_action_modules_are_served_as_javascript(client):
 
 
 def test_cors_on_public_artifacts(client):
+    for path in (
+        "/agent-manifest.json",
+        "/workgraph.network.json",
+        "/agent-mcp.json",
+        "/links.json",
+        "/.well-known/nsdeploy.json",
+        "/runtime/index.js",
+        "/site-actions.js",
+        "/page-bridge.js",
+    ):
+        response = client.get(path)
+        assert response.status_code == 200, path
+        assert response.headers["access-control-allow-origin"] == "*", path
+
     response = client.get("/agent-manifest.json", headers={"Origin": "https://peer.example"})
     assert response.headers["access-control-allow-origin"] == "*"
 
@@ -535,3 +550,69 @@ def test_assistant_models_lists_only_free_ids(client):
     assert ids
     assert all(model.endswith(":free") for model in ids)
     assert "OPENROUTER_API_KEY" not in json.dumps(body)
+
+
+def test_vercel_uses_a_writable_tmp_store(monkeypatch):
+    monkeypatch.setenv("VERCEL", "1")
+    assert str(_default_store_path()).replace("\\", "/") == "/tmp/workgraph.rl"
+    monkeypatch.delenv("VERCEL")
+    assert _default_store_path().name == "workgraph.rl"
+
+
+class MissingBlobStorage:
+    kind = "vercel_blob"
+
+    def __init__(self):
+        self.saved = b""
+
+    def load_to(self, path):
+        raise StorageError("blob_missing", "no snapshot")
+
+    def save_from(self, path):
+        self.saved = Path(path).read_bytes()
+
+
+class FailingBlobStorage:
+    kind = "vercel_blob"
+
+    def load_to(self, path):
+        raise StorageError("blob_read_failed", "blob is unreachable")
+
+    def save_from(self, path):
+        raise AssertionError("a transient read error must not overwrite the blob")
+
+
+def test_a_missing_blob_seeds_from_the_committed_store(tmp_path):
+    storage = MissingBlobStorage()
+    create_app(tmp_path / "workgraph.rl", storage=storage)
+    assert len(storage.saved) > 0
+
+
+def test_a_transient_blob_error_does_not_seed_or_overwrite(tmp_path):
+    with pytest.raises(StorageError) as error:
+        create_app(tmp_path / "workgraph.rl", storage=FailingBlobStorage())
+    assert error.value.code == "blob_read_failed"
+
+
+def test_production_ignores_the_demo_flags(tmp_path, monkeypatch):
+    path = tmp_path / "workgraph.rl"
+    with connect(path) as conn:
+        seed(conn)
+        conn.flush()
+    monkeypatch.setenv("WORKGRAPH_ENV", "production")
+    monkeypatch.setenv("WORKGRAPH_ASSISTANT_MOCK", "1")
+    monkeypatch.setenv("PAYPAL_MOCK", "1")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    app = create_app(path)
+    with TestClient(app) as client:
+        config = client.get("/api/config").json()
+        answer = client.post(
+            "/api/assistant",
+            json={"messages": [{"role": "user", "content": "hello"}]},
+        )
+    assert config["environment"] == "production"
+    assert config["assistant_mock"] is False
+    assert config["assistant_live"] is False
+    assert app.state.paypal.mock is False
+    assert answer.status_code == 503
+    assert answer.json()["detail"]["code"] == "assistant_not_configured"

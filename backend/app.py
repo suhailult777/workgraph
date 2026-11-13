@@ -79,6 +79,10 @@ def _is_production() -> bool:
     )
 
 
+def _default_store_path() -> Path:
+    return Path("/tmp/workgraph.rl") if os.environ.get("VERCEL") else DEFAULT_STORE
+
+
 def _client_ip(request: Request) -> str:
     forwarded = request.headers.get("x-forwarded-for", "")
     if forwarded:
@@ -189,13 +193,14 @@ def create_app(
     assistant: AssistantService | None = None,
     paypal: PayPalClient | None = None,
 ) -> FastAPI:
-    path = Path(store) if store else Path(os.environ.get("WORKGRAPH_STORE", DEFAULT_STORE))
+    default_store = _default_store_path()
+    path = Path(store) if store else Path(os.environ.get("WORKGRAPH_STORE", default_store))
     selected_storage = storage or build_storage()
     if selected_storage.kind != "local_file":
         try:
             selected_storage.load_to(path)
-        except StorageError:
-            if DEFAULT_STORE.exists():
+        except StorageError as exc:
+            if exc.code == "blob_missing" and DEFAULT_STORE.exists():
                 path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(DEFAULT_STORE, path)
                 selected_storage.save_from(path)
@@ -251,6 +256,29 @@ def create_app(
     app.state.storage = selected_storage
     app.state.assistant = assistant_service
     app.state.paypal = paypal_client
+
+    public_artifacts = (
+        "/agent-manifest.json",
+        "/workgraph.network.json",
+        "/agent-mcp.json",
+        "/links.json",
+        "/workgraph.hocon",
+        "/site-actions.js",
+        "/page-bridge.js",
+    )
+
+    @app.middleware("http")
+    async def public_artifact_cors(request, call_next):
+        response = await call_next(request)
+        path = request.url.path
+        if request.method in {"GET", "HEAD"} and (
+            path in public_artifacts
+            or path.startswith("/.well-known/")
+            or path.startswith("/runtime/")
+        ):
+            response.headers["Access-Control-Allow-Origin"] = "*"
+            response.headers["Access-Control-Allow-Methods"] = "GET, HEAD, OPTIONS"
+        return response
 
     @app.exception_handler(GraphError)
     async def graph_error(_request, exc: GraphError) -> JSONResponse:
@@ -643,8 +671,7 @@ def create_app(
         )
     if (PUBLIC / ".well-known").is_dir():
         app.mount("/.well-known", StaticFiles(directory=PUBLIC / ".well-known"), name="well-known")
-    if DIST.is_dir():
-        app.mount("/", StaticFiles(directory=DIST, html=True), name="frontend")
+    app.mount("/", StaticFiles(directory=DIST, html=True, check_dir=False), name="frontend")
 
     return app
 

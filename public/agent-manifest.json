@@ -29,7 +29,7 @@
   "peer_policy": {
     "mode": "closed",
     "deny_origins": [],
-    "note": "Phase 1 milestone 2: browser reads and a local draft only."
+    "note": "Phase 1 milestone 4: browser reads, confirmed writes and a live/BYOK router."
   },
   "agent_mcp": {
     "protocol": "nsdeploy-agent-mcp/v1",

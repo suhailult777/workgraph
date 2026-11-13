@@ -300,7 +300,7 @@ export function ProjectView({
             <div className="panel-head">
               <div>
                 <p className="eyebrow">Dependency paths</p>
-                <h2 id="blocked-title">Blocked by</h2>
+                <h2 id="blocked-title">Blocked now</h2>
               </div>
               <span className="panel-count">{blockedMilestones.length}</span>
             </div>

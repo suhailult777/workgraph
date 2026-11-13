@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""Check the Agentic Web conformance artifacts locally.
+
+Run from the repository root:
+
+    python scripts/check_conformance
+    python scripts/check_conformance --http http://127.0.0.1:8090
+
+The static checks do not need a server. --http also verifies that the public
+artifact URLs return 200 and Access-Control-Allow-Origin: *.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+PUBLIC = ROOT / "public"
+SECRET_PATTERNS = re.compile(
+    r"(sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}"
+    r"|AKIA[0-9A-Z]{16}|BEGIN [A-Z ]*PRIVATE KEY"
+    r"|OPENROUTER_API_KEY\s*=\s*[^\s]+|PAYPAL_CLIENT_SECRET\s*=\s*[^\s]+"
+    r"|BLOB_READ_WRITE_TOKEN\s*=\s*[^\s]+)"
+)
+PUBLIC_PATHS = (
+    "/agent-manifest.json",
+    "/workgraph.network.json",
+    "/links.json",
+    "/agent-mcp.json",
+    "/.well-known/nsdeploy.json",
+    "/runtime/index.js",
+    "/site-actions.js",
+    "/page-bridge.js",
+)
+
+
+class Checker:
+    def __init__(self) -> None:
+        self.failed = 0
+
+    def check(self, name: str, ok: bool, detail: str = "") -> None:
+        print(f"{'PASS' if ok else 'FAIL'} {name}{f': {detail}' if detail and not ok else ''}")
+        if not ok:
+            self.failed += 1
+
+    def json_file(self, path: Path) -> dict | None:
+        if not path.exists():
+            self.check(path.name, False, "missing")
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except ValueError as exc:
+            self.check(path.name, False, f"invalid JSON: {exc}")
+            return None
+
+
+def static_checks(checker: Checker) -> None:
+    manifest = checker.json_file(PUBLIC / "agent-manifest.json")
+    if manifest is None:
+        return
+    networks = manifest.get("networks")
+    checker.check("manifest has a network list", isinstance(networks, list) and bool(networks))
+    if not isinstance(networks, list) or not networks:
+        return
+    network_entry = networks[0]
+    for key in ("name", "front_man", "hocon"):
+        checker.check(f"manifest network has {key}", bool(network_entry.get(key)))
+    hocon_path = PUBLIC / str(network_entry.get("hocon", "")).replace("./", "")
+    checker.check("manifest hocon points at a file", hocon_path.exists(), str(hocon_path))
+    checker.check("manifest has llm_router", isinstance(manifest.get("llm_router"), dict))
+    checker.check("manifest has peer_policy", isinstance(manifest.get("peer_policy"), dict))
+    actions = manifest.get("actions", {})
+    agent_tools = actions.get("agentTools") if isinstance(actions, dict) else None
+    checker.check("manifest lists site actions", isinstance(agent_tools, list) and len(agent_tools) >= 4)
+    for name in ("get_graph_state", "search_similar_work", "accept_plan", "record_payment"):
+        checker.check(f"manifest registers {name}", isinstance(agent_tools, list) and name in agent_tools)
+
+    network = checker.json_file(PUBLIC / "workgraph.network.json")
+    if network is not None:
+        tools = network.get("tools")
+        names = [tool.get("name") for tool in tools or [] if isinstance(tool, dict)]
+        checker.check("resolved network has at least two agents", len(names) >= 2, str(names))
+        checker.check("resolved network names the front agent", network_entry["front_man"] in names)
+        text = json.dumps(network)
+        checker.check("resolved network has no includes", "include" not in text.lower())
+        checker.check("resolved network has no substitutions", "${" not in text)
+        checker.check("resolved network has no local paths", not re.search(r"[A-Za-z]:\\\\|/Users/|file://", text))
+
+    links = checker.json_file(PUBLIC / "links.json")
+    checker.check("links.json has networks", isinstance(links, dict) and "networks" in links)
+
+    runtime = PUBLIC / "runtime"
+    checker.check("runtime directory exists", runtime.is_dir())
+    checker.check("runtime index exists", (runtime / "index.js").exists())
+    checker.check("runtime is a browser module", (runtime / "engine.js").exists())
+
+    actions_js = PUBLIC / "site-actions.js"
+    checker.check("site-actions.js exists", actions_js.exists())
+    if actions_js.exists():
+        text = actions_js.read_text(encoding="utf-8")
+        for name in ("get_graph_state", "search_similar_work", "get_decline_path", "accept_plan", "record_payment"):
+            checker.check(f"site action {name} is registered", name in text)
+        checker.check("accept_plan is irreversible", 'name: "accept_plan"' in text and "irreversible" in text)
+        checker.check("record_payment is irreversible", 'name: "record_payment"' in text)
+
+    bridge = PUBLIC / "page-bridge.js"
+    checker.check("page-bridge.js exists", bridge.exists())
+    checker.check("assistant mount exists", (ROOT / "frontend/src/components/AssistantPanel.tsx").exists())
+    checker.check("BYOK panel exists", (ROOT / "frontend/src/components/AssistantPanel.tsx").exists())
+    app_text = (ROOT / "frontend/src/App.tsx").read_text(encoding="utf-8") if (ROOT / "frontend/src/App.tsx").exists() else ""
+    checker.check("assistant is mounted in the page", "AssistantPanel" in app_text)
+
+    well_known = PUBLIC / ".well-known/nsdeploy.json"
+    checker.check(".well-known discovery exists", well_known.exists())
+    checker.check("agent-mcp.json exists", (PUBLIC / "agent-mcp.json").exists())
+
+    public_text = "\n".join(
+        path.read_text(encoding="utf-8", errors="replace")
+        for path in PUBLIC.rglob("*")
+        if path.is_file() and path.suffix in {".json", ".hocon", ".js"} and "runtime" not in path.parts
+    )
+    checker.check("public artifacts contain no secret patterns", not SECRET_PATTERNS.search(public_text))
+
+    dist_index = ROOT / "frontend/dist/index.html"
+    if dist_index.exists():
+        checker.check("built frontend exists", True)
+        built = dist_index.read_text(encoding="utf-8")
+        checker.check("built page has a root element", 'id="root"' in built)
+
+
+def http_checks(checker: Checker, base: str) -> None:
+    for path in PUBLIC_PATHS:
+        request = urllib.request.Request(base.rstrip("/") + path, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                body = response.read(200)
+                cors = response.headers.get("access-control-allow-origin")
+                status = response.status
+        except urllib.error.URLError as exc:
+            checker.check(f"GET {path}", False, str(exc))
+            continue
+        checker.check(f"GET {path}", status == 200 and bool(body))
+        checker.check(f"CORS {path}", cors == "*", str(cors))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--http", metavar="BASE_URL", help="also check live URLs")
+    args = parser.parse_args()
+
+    checker = Checker()
+    static_checks(checker)
+    if args.http:
+        http_checks(checker, args.http)
+    if checker.failed:
+        print(f"{checker.failed} conformance check(s) failed")
+        return 1
+    print("all conformance checks passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

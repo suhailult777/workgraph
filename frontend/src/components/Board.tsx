@@ -194,7 +194,8 @@ export function Board({ projects, loading, error, creating, createError, onCreat
             </button>
           </div>
         ) : loading && !projects ? (
-          <div className="project-grid">
+          <div className="project-grid" role="status" aria-live="polite" aria-busy="true">
+            <span className="sr-only">Loading projects.</span>
             <SkeletonCard />
             <SkeletonCard />
           </div>

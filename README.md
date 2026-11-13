@@ -4,12 +4,10 @@ WorkGraph is a new open agentic website for freelance work: projects, milestone
 dependencies, invoices and sample payments live in a persistent Relate graph.
 People and browser agents read and change the same graph.
 
-**Status: Phase 1, milestone 3 (26-30 Nov 2026).** Local only. Not pushed,
-hosted or submitted. The human UI, the graph operations and the browser
-assistant are working. The assistant reads the graph, traces decline paths, and
-can accept a plan or record a sample payment only after an on-screen
-confirmation. Production defaults to a live server-side free model; the local
-no-key demo is a labelled development fallback.
+**Status: Phase 1, milestone 4 (1-4 Dec 2026).** Deployable to Vercel Hobby.
+Local checks pass. Nothing was pushed or deployed by this task. The human UI,
+graph operations, browser assistant, live server assistant, sandbox PayPal and
+durable Blob snapshot path are in place. Production refuses demo mode.
 
 ## What is here
 
@@ -19,6 +17,11 @@ no-key demo is a labelled development fallback.
 | `backend/assistant.py` | Server-side OpenRouter free-model proxy with per-IP and global daily caps |
 | `backend/paypal.py` | PayPal Orders v2 sandbox client, capture verification and webhook check |
 | `backend/storage.py` | Local file or Vercel Blob snapshot with ETag compare-and-swap |
+| `vercel.json` | Vercel build, Python function, static public artifacts and CORS headers |
+| `pyproject.toml` | Vercel FastAPI entrypoint and static CDN settings |
+| `docs/DEPLOY.md` | Exact Vercel link and deploy commands, env names and checks |
+| `docs/RELATE_SETUP.md` | Relate install, store, CLI and Vercel `/tmp` + Blob notes |
+| `scripts/check_conformance` | Local Agentic Web artifact and CORS checker |
 | `backend/demo_llm.py` | Deterministic no-key scripted model for the local demo |
 | `frontend/` | React + TypeScript human UI: board, project graph, queries, payment and sandbox dialog, assistant mount |
 | `public/` | Agentic Web artifacts: manifest, resolved network, links, runtime, site actions |
@@ -77,8 +80,12 @@ seeds its own temporary store.
 .\.venv\Scripts\python.exe -m pytest -q
 npm run test:agent     # Node 22 or newer, no provider
 npm run check:network
+.\.venv\Scripts\python.exe scripts\check_conformance
 .\.venv\Scripts\python.exe scripts\judge_pass.py   # needs the server running
 ```
+
+`scripts/check_conformance --http http://127.0.0.1:8090` also checks the public
+artifact URLs and their `Access-Control-Allow-Origin: *` headers.
 
 ## Human UI
 
@@ -179,6 +186,33 @@ The payment dialog has a separate **PayPal sandbox checkout** section.
 The client refuses every host except `api-m.sandbox.paypal.com`. `PAYPAL_MOCK=1`
 returns a labelled `MOCK-` order for local tests and screenshots; production
 ignores it. No real money is ever used.
+
+## Vercel deployment
+
+The repository is prepared for Vercel Hobby, project `workgraph`, team
+`suhailult777s-projects`. Nothing was deployed here.
+
+- `vercel.json` builds the Vite app, sets the Python function, adds CORS headers
+  for public artifacts and adds path-route fallbacks.
+- `pyproject.toml` points Vercel at `backend.app:app` and enables CDN promotion
+  for the mounted `frontend/dist` files.
+- `public/` is served by Vercel at the root: manifest, resolved network, links,
+  MCP and discovery files, runtime, site actions.
+- `/api/*` reaches FastAPI. Static files do not.
+- On Vercel, the Relate store is `/tmp/workgraph.rl`; the durable copy is a
+  private Vercel Blob snapshot written with `x-if-match` and retry.
+- Production without `OPENROUTER_API_KEY` shows NOT CONFIGURED, not a demo.
+
+Exact commands, environment variable names and post-deploy checks are in
+[`docs/DEPLOY.md`](docs/DEPLOY.md). Relate details are in
+[`docs/RELATE_SETUP.md`](docs/RELATE_SETUP.md).
+
+```powershell
+npx vercel@latest link --project workgraph --scope suhailult777s-projects
+npx vercel@latest --prod --yes
+```
+
+Do not run these from a task that is not allowed to deploy.
 
 ## Assistant artifacts
 
@@ -349,6 +383,13 @@ Result: `Build` and `Handover` both wait on `Design system` (invoice `WG-1002`,
 - [`docs/shots/p1m3-live-badge.png`](docs/shots/p1m3-live-badge.png): LIVE badge in the header.
 - [`docs/shots/p1m3-quota.png`](docs/shots/p1m3-quota.png): quota-exhausted message.
 - [`docs/shots/p1m3-sandbox-checkout.png`](docs/shots/p1m3-sandbox-checkout.png): labelled mock PayPal sandbox checkout.
+- [`docs/shots/p1m4-home.png`](docs/shots/p1m4-home.png): board and create form at 1440.
+- [`docs/shots/p1m4-project.png`](docs/shots/p1m4-project.png): project graph and milestone trail.
+- [`docs/shots/p1m4-blocked.png`](docs/shots/p1m4-blocked.png): the "Blocked now" dependency panel.
+- [`docs/shots/p1m4-assistant.png`](docs/shots/p1m4-assistant.png): assistant, sample prompts and BYOK panel.
+- [`docs/shots/p1m4-checkout.png`](docs/shots/p1m4-checkout.png): labelled mock PayPal sandbox checkout.
+- [`docs/shots/p1m4-mobile.png`](docs/shots/p1m4-mobile.png): board at 390 with a compact graph-ready status.
+- [`docs/shots/p1m4-production-not-configured.png`](docs/shots/p1m4-production-not-configured.png): production mode with no key, showing NOT CONFIGURED instead of a demo.
 
 ## Limits
 

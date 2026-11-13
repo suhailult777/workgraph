@@ -4,3 +4,10 @@ norecursedirs = ["vendor", ".venv", "frontend", "node_modules"]
 
 [tool.ruff]
 line-length = 100
+
+[tool.vercel]
+entrypoint = "backend.app:app"
+
+[tool.vercel.fastapi.static]
+cdn = true
+exclude = true

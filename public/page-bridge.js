@@ -4,6 +4,10 @@
 
 const STATE_URL = "/api/graph/state";
 const SIMILAR_URL = "/api/graph/similar";
+const DECLINE_URL = "/api/graph/decline-path";
+const ACCEPT_PLAN_URL = "/api/plans/accept";
+const PAYMENTS_URL = "/api/payments";
+const PAYPAL_ORDER_URL = "/api/paypal/orders";
 const DRAFT_KEY = "workgraph-plan-draft-v1";
 
 async function getJson(url) {
@@ -19,7 +23,29 @@ async function getJson(url) {
     const reason =
       (typeof detail === "string" ? detail : detail?.message) ||
       `The graph service answered ${response.status}.`;
-    return { ok: false, reason };
+    return { ok: false, reason, code: detail?.code };
+  }
+  return body;
+}
+
+async function postJson(url, payload) {
+  let response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify(payload),
+    });
+  } catch {
+    return { ok: false, reason: "Could not reach the local graph service." };
+  }
+  const body = await response.json().catch(() => null);
+  if (!response.ok) {
+    const detail = body?.detail;
+    const reason =
+      (typeof detail === "string" ? detail : detail?.message) ||
+      `The graph service answered ${response.status}.`;
+    return { ok: false, reason, code: detail?.code };
   }
   return body;
 }
@@ -61,6 +87,73 @@ export class WorkGraphPage {
     return { ok: true, skill: body.skill, work: body.work || [] };
   }
 
+  static async getDeclinePath(invoiceNumber) {
+    const number = String(invoiceNumber || "").trim();
+    if (!number) {
+      return { ok: false, reason: "An invoice number is required.", field: "invoice" };
+    }
+    const body = await getJson(`${DECLINE_URL}?invoice=${encodeURIComponent(number)}`);
+    if (body.ok === false) return body;
+    return { ok: true, ...body };
+  }
+
+  static async acceptPlan({ projectName, milestones } = {}) {
+    const name = String(projectName || "").trim().slice(0, 80);
+    if (!name) {
+      return { ok: false, reason: "A project name is required.", field: "projectName" };
+    }
+    const plan = Array.isArray(milestones) && milestones.length ? milestones : planTemplate();
+    const body = await postJson(ACCEPT_PLAN_URL, {
+      project_name: name,
+      milestones: plan.map((step) => ({
+        name: String(step.name || "").trim(),
+        depends_on: Array.isArray(step.depends_on) ? step.depends_on.map(String) : [],
+      })),
+    });
+    if (body.ok === false) return body;
+    return { ok: true, ...body };
+  }
+
+  static async recordPayment({ invoiceId, amountCents } = {}) {
+    const invoice = String(invoiceId || "").trim();
+    if (!invoice) {
+      return { ok: false, reason: "An invoice id is required.", field: "invoiceId" };
+    }
+    if (!Number.isInteger(amountCents) || amountCents <= 0) {
+      return {
+        ok: false,
+        reason: "The exact invoice amount in integer cents is required.",
+        field: "amountCents",
+      };
+    }
+    const body = await postJson(PAYMENTS_URL, {
+      invoice_id: invoice,
+      amount_cents: amountCents,
+    });
+    if (body.ok === false) return body;
+    return { ok: true, ...body };
+  }
+
+  static async createPayPalOrder(invoiceId) {
+    const invoice = String(invoiceId || "").trim();
+    if (!invoice) {
+      return { ok: false, reason: "An invoice id is required.", field: "invoiceId" };
+    }
+    const body = await postJson(PAYPAL_ORDER_URL, { invoice_id: invoice });
+    if (body.ok === false) return body;
+    return { ok: true, ...body };
+  }
+
+  static async capturePayPalOrder(orderId) {
+    const order = String(orderId || "").trim();
+    if (!order) {
+      return { ok: false, reason: "A PayPal order id is required.", field: "orderId" };
+    }
+    const body = await postJson(`${PAYPAL_ORDER_URL}/${encodeURIComponent(order)}/capture`, {});
+    if (body.ok === false) return body;
+    return { ok: true, ...body };
+  }
+
   static async proposePlan({ brief, projectName } = {}) {
     const text = String(brief || "").trim();
     if (!text) {
@@ -90,7 +183,7 @@ export class WorkGraphPage {
       similar_work: similar,
       note:
         "Draft only. No amounts are proposed and the graph is not changed. " +
-        "Accepting a plan is not available in this milestone.",
+        "Review it and confirm before accepting; cancel changes nothing.",
     };
   }
 
@@ -131,7 +224,7 @@ export class WorkGraphPage {
       draft,
       note:
         "Draft saved in this tab only. The graph did not change. " +
-        "Accepting a plan is not available in this milestone.",
+        "Review it and confirm before accepting; cancel changes nothing.",
     };
   }
 }

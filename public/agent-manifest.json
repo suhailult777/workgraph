@@ -5,23 +5,24 @@
       "name": "workgraph",
       "front_man": "workgraph_coordinator",
       "hocon": "./workgraph.network.json",
-      "description": "Ask the sample graph which milestones are blocked, find paid work by skill, and draft a plan without writing to the graph.",
+      "description": "Trace invoice decline paths, find paid work by skill, draft a plan, and accept or pay only after an on-screen confirmation.",
       "tags": [
         "agentified-website",
         "relate-hackathon"
       ],
       "sample_queries": [
-        "Which milestones are blocked by an unpaid invoice?",
+        "Which milestones are blocked until WG-1002 is paid?",
         "Who has been paid for design-system work before?",
         "Show the projects and their milestone status.",
-        "Draft a four-step plan for a new brand project.",
+        "Draft and accept a plan for a new brand project.",
+        "Record the sample payment for WG-1002.",
         "Record a real card payment for the design system."
       ]
     }
   ],
   "llm_router": {
-    "base_url": "/api/demo/llm",
-    "mock": true,
+    "base_url": "/api/assistant",
+    "mock": false,
     "byok_router": "https://openrouter.ai/api/v1"
   },
   "allowed_peers": [],
@@ -72,8 +73,11 @@
     "agentTools": [
       "get_graph_state",
       "search_similar_work",
+      "get_decline_path",
       "propose_plan",
-      "fill_draft"
+      "fill_draft",
+      "accept_plan",
+      "record_payment"
     ]
   }
 }

@@ -4,12 +4,12 @@ WorkGraph is a new open agentic website for freelance work: projects, milestone
 dependencies, invoices and sample payments live in a persistent Relate graph.
 People and browser agents read and change the same graph.
 
-**Status: Phase 1, milestone 6 (15 Nov 2026).** Local checks pass. Nothing was
+**Status: Phase 1, milestone 7 (15 Nov 2026).** Local checks pass. Nothing was
 pushed or deployed by this task. The human UI, graph operations, browser
-assistant, live server assistant with cited retrieval and empty-completion
-retry, sandbox PayPal checkout with a return-to-app capture, webhook signature
-verification and the durable Blob snapshot path are in place. Production
-refuses demo mode.
+assistant, live server assistant with cited retrieval, empty-completion retry
+and timeout-safe free-model fallback, sandbox PayPal checkout with a
+return-to-app capture, webhook signature verification and the durable Blob
+snapshot path are in place. Production refuses demo mode.
 
 ## What is here
 
@@ -134,8 +134,10 @@ API as the page.
 - **Live mode:** when `/api/config` reports `assistant_live: true`, the browser
   boots the runtime against `/api/assistant`. The server calls OpenRouter with
   an allowlist of model ids ending in `:free`, falls back to the next free model
-  on 429/5xx or an empty reasoning-only completion, and enforces per-IP and
-  global daily caps. The key stays on the server.
+  on 429/5xx, a transport timeout or an empty reasoning-only completion, and
+  enforces per-IP and global daily caps. Each attempt has its own timeout and
+  the whole call has a deadline; total failure is JSON `503 upstream_timeout`.
+  The key stays on the server.
 - **Local demo:** with `WORKGRAPH_ASSISTANT_MOCK=1` on a development host, the
   same server endpoint uses the deterministic scripted model. The panel labels
   it `DEV` / `Local demo`. Production never selects it.
@@ -172,6 +174,9 @@ milestone names and dependencies, no amounts, and has **Accept plan** and
 - `OPENROUTER_FREE_MODELS`: comma list; ids not ending in `:free` are dropped.
 - `ASSISTANT_IP_DAILY_CAP` (default 20) and `ASSISTANT_GLOBAL_DAILY_CAP`
   (default 300): durable daily counters.
+- `ASSISTANT_ATTEMPT_TIMEOUT_SECONDS` (default 22) and
+  `ASSISTANT_TOTAL_TIMEOUT_SECONDS` (default 75): per-model timeout and one
+  call's overall deadline. `vercel.json` sets the Hobby maximum of 300 seconds.
 - `PAYPAL_CLIENT_ID`, `PAYPAL_CLIENT_SECRET`, `PAYPAL_WEBHOOK_ID`: sandbox only.
 - `BLOB_READ_WRITE_TOKEN`, `BLOB_STORE_PATH`: durable Vercel Blob snapshot.
 - `WORKGRAPH_ENV=production` or `VERCEL=1`: refuses the local demo and mock

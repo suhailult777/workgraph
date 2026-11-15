@@ -1026,3 +1026,115 @@ def test_http_route_retries_an_empty_reasoning_completion_and_returns_citations(
     assert "Visible answer." in response.text
     assert "[ms-h3]" in response.text or "[inv-h2]" in response.text
     assert response.headers["x-nsdeploy-llm-route"] == "live"
+
+def test_http_route_retries_a_transport_timeout_and_returns_citations(tmp_path):
+    import httpx
+
+    path = tmp_path / "workgraph.rl"
+    with connect(path) as conn:
+        seed(conn)
+        conn.flush()
+    app = create_app(path)
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        calls.append(body["model"])
+        if len(calls) == 1:
+            raise httpx.ReadTimeout("slow free model")
+        return httpx.Response(
+            200,
+            json={
+                "model": body["model"],
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "Visible after timeout."},
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+        )
+
+    app.state.assistant = AssistantService(
+        api_key="test",
+        models=["a:free", "b:free"],
+        transport=httpx.MockTransport(handler),
+        retrieve=lambda question: app.state.graph.call(
+            lambda conn: retrieve_context(conn, question)
+        ),
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/assistant/chat/completions",
+            json={
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Which milestones are blocked until WG-1002 is paid?",
+                    }
+                ]
+            },
+        )
+    assert response.status_code == 200
+    assert calls == ["a:free", "b:free"]
+    assert "Visible after timeout." in response.text
+    assert "[ms-h3]" in response.text or "[inv-h2]" in response.text
+
+
+def test_all_http_timeouts_return_a_json_503(tmp_path):
+    import httpx
+
+    path = tmp_path / "workgraph.rl"
+    with connect(path) as conn:
+        seed(conn)
+        conn.flush()
+    app = create_app(path)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("slow free model")
+
+    app.state.assistant = AssistantService(
+        api_key="test",
+        models=["a:free", "b:free"],
+        transport=httpx.MockTransport(handler),
+    )
+    with TestClient(app) as client:
+        for route in ("/api/assistant", "/api/assistant/chat/completions"):
+            response = client.post(
+                route,
+                json={"messages": [{"role": "user", "content": "hello"}]},
+            )
+            assert response.status_code == 503, route
+            assert response.headers["content-type"].startswith("application/json"), route
+            assert response.json()["detail"]["code"] == "upstream_timeout", route
+
+
+def test_the_assistant_routes_never_return_a_plain_text_500(tmp_path):
+    path = tmp_path / "workgraph.rl"
+    with connect(path) as conn:
+        seed(conn)
+        conn.flush()
+    app = create_app(path)
+
+    class BrokenAssistant:
+        mock = False
+
+        def chat(self, payload, ip):
+            raise RuntimeError("unexpected failure")
+
+    app.state.assistant = BrokenAssistant()
+    with TestClient(app) as client:
+        for route in ("/api/assistant", "/api/assistant/chat/completions"):
+            response = client.post(
+                route,
+                json={"messages": [{"role": "user", "content": "hello"}]},
+            )
+            assert response.status_code == 500, route
+            assert response.headers["content-type"].startswith("application/json"), route
+            assert response.json()["detail"]["code"] == "assistant_internal", route
+
+
+def test_vercel_allows_the_hobby_max_duration():
+    config = json.loads((ROOT / "vercel.json").read_text(encoding="utf-8"))
+    assert config["functions"]["backend/app.py"]["maxDuration"] == 300

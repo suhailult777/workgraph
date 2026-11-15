@@ -2,13 +2,15 @@
 
 The browser runtime still owns the tool loop and the confirmation dialog. This
 service only forwards the chat request to an allowlisted free model, enforces a
-per-IP and global daily cap, and falls back to the next free model on 429/5xx.
+per-IP and global daily cap, and falls back to the next free model on 429/5xx,
+transport errors or an empty reasoning-only completion.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -17,9 +19,9 @@ import httpx
 from graph.retrieval import citations_for, source_line
 
 DEFAULT_FREE_MODELS = (
+    "google/gemma-4-26b-a4b-it:free",
     "google/gemma-4-31b-it:free",
     "nvidia/nemotron-3-ultra-550b-a55b:free",
-    "google/gemma-4-26b-a4b-it:free",
 )
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 
@@ -41,6 +43,13 @@ def free_models() -> list[str]:
 
 def _utc_day() -> str:
     return datetime.now(timezone.utc).date().isoformat()
+
+
+def _float_env(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
 
 
 def _completion(model: str, content: str, tool_calls: list[dict] | None = None) -> dict:
@@ -169,6 +178,8 @@ class AssistantService:
         ip_cap: int | None = None,
         global_cap: int | None = None,
         retrieve: Callable[[str], dict] | None = None,
+        attempt_timeout: float | None = None,
+        total_timeout: float | None = None,
     ):
         self.api_key = api_key if api_key is not None else os.environ.get("OPENROUTER_API_KEY", "")
         self.models = models or free_models()
@@ -176,6 +187,16 @@ class AssistantService:
         self.transport = transport
         self.mock = mock
         self.retrieve = retrieve
+        self.attempt_timeout = (
+            attempt_timeout
+            if attempt_timeout is not None
+            else _float_env("ASSISTANT_ATTEMPT_TIMEOUT_SECONDS", 22.0)
+        )
+        self.total_timeout = (
+            total_timeout
+            if total_timeout is not None
+            else _float_env("ASSISTANT_TOTAL_TIMEOUT_SECONDS", 75.0)
+        )
         self.ip_cap = ip_cap if ip_cap is not None else int(os.environ.get("ASSISTANT_IP_DAILY_CAP", "20"))
         self.global_cap = (
             global_cap
@@ -206,7 +227,9 @@ class AssistantService:
             429,
         )
 
-    def _upstream(self, model: str, messages: list[dict], tools: list[dict]) -> dict:
+    def _upstream(
+        self, model: str, messages: list[dict], tools: list[dict], timeout: float
+    ) -> dict:
         body: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -222,8 +245,18 @@ class AssistantService:
             "HTTP-Referer": "https://workgraph.local",
             "X-Title": "WorkGraph",
         }
-        with httpx.Client(transport=self.transport, timeout=45) as client:
-            response = client.post(f"{OPENROUTER_BASE}/chat/completions", json=body, headers=headers)
+        try:
+            with httpx.Client(
+                transport=self.transport,
+                timeout=httpx.Timeout(timeout, connect=min(5.0, timeout)),
+            ) as client:
+                response = client.post(
+                    f"{OPENROUTER_BASE}/chat/completions", json=body, headers=headers
+                )
+        except httpx.TimeoutException as exc:
+            raise _RetryModel("timeout") from exc
+        except httpx.TransportError as exc:
+            raise _RetryModel("transport") from exc
         if response.status_code in (429,) or response.status_code >= 500:
             raise _RetryModel("unavailable")
         if response.status_code in (401, 403):
@@ -324,9 +357,15 @@ class AssistantService:
 
         upstream_messages = self._with_context(messages, bundle)
         reasons: set[str] = set()
+        deadline = time.monotonic() + max(0.0, self.total_timeout)
         for model in ordered:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.5:
+                reasons.add("timeout")
+                break
+            timeout = max(0.5, min(self.attempt_timeout, remaining))
             try:
-                data = self._upstream(model, upstream_messages, tools)
+                data = self._upstream(model, upstream_messages, tools, timeout)
             except _RetryModel as exc:
                 reasons.add(exc.reason)
                 continue
@@ -338,6 +377,12 @@ class AssistantService:
                 "Every free assistant model returned only reasoning tokens and no visible answer. "
                 "Try again shortly.",
                 502,
+            )
+        if "timeout" in reasons:
+            raise AssistantError(
+                "upstream_timeout",
+                "The free assistant models took too long to answer. Try again shortly.",
+                503,
             )
         raise AssistantError(
             "upstream_unavailable",

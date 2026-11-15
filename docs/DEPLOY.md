@@ -63,6 +63,8 @@ Set these in the Vercel project. Values are never committed or printed here.
 | `OPENROUTER_FREE_MODELS` | Optional comma list; ids must end in `:free` |
 | `ASSISTANT_IP_DAILY_CAP` | Per-IP daily cap, default 20 |
 | `ASSISTANT_GLOBAL_DAILY_CAP` | Global daily cap, default 300 |
+| `ASSISTANT_ATTEMPT_TIMEOUT_SECONDS` | Per-model timeout, default 22 |
+| `ASSISTANT_TOTAL_TIMEOUT_SECONDS` | Overall assistant deadline, default 75 |
 | `PAYPAL_CLIENT_ID` | PayPal sandbox client id |
 | `PAYPAL_CLIENT_SECRET` | PayPal sandbox client secret |
 | `PAYPAL_WEBHOOK_ID` | PayPal sandbox webhook id |
@@ -110,6 +112,21 @@ the external order id.
 If the deployment is behind a proxy, keep the raw body untouched. The endpoint
 reads `request.body()` before parsing so the event object sent for verification
 matches PayPal's payload.
+
+## Assistant timeout budget
+
+`vercel.json` sets `maxDuration` to **300** seconds, the current Hobby default
+and maximum for Node.js, Bun and Python functions with Fluid compute. The
+assistant does not use the whole window: each free-model attempt defaults to 22
+seconds, and one user call has an overall deadline of 75 seconds. With the
+default three-model list, the worst case is about 66 seconds. Both values can be
+lowered with `ASSISTANT_ATTEMPT_TIMEOUT_SECONDS` and
+`ASSISTANT_TOTAL_TIMEOUT_SECONDS`.
+
+A timeout or transport error skips to the next free model. If every model times
+out, `POST /api/assistant` and the SSE route return JSON `503 upstream_timeout`
+with a clear message. An unexpected exception returns JSON `500
+assistant_internal`; neither route should emit a plain-text 500.
 
 ## Exact deploy commands
 

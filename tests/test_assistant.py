@@ -366,3 +366,90 @@ def test_a_tool_call_with_empty_content_is_not_retried():
         "127.0.0.1",
     )
     assert completion["choices"][0]["message"]["tool_calls"][0]["id"] == "call-1"
+
+@pytest.mark.parametrize("error", [httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError])
+def test_a_transport_timeout_is_retried_on_the_next_free_model(error):
+    records: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        records.append(body["model"])
+        if body["model"] == "a:free":
+            raise error("slow or unreachable")
+        return httpx.Response(
+            200,
+            json={
+                "model": body["model"],
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "After timeout."},
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+        )
+
+    service = AssistantService(
+        api_key="test",
+        models=["a:free", "b:free"],
+        transport=httpx.MockTransport(handler),
+        quota=lambda ip, day, ip_cap, global_cap: {"allowed": True},
+    )
+    completion = service.chat(
+        {"messages": [{"role": "user", "content": "Which milestone is blocked?"}]},
+        "127.0.0.1",
+    )
+    assert records == ["a:free", "b:free"]
+    assert completion["model"] == "b:free"
+    assert completion["choices"][0]["message"]["content"] == "After timeout."
+
+
+def test_all_timeouts_return_a_clean_upstream_timeout_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("slow")
+
+    service = AssistantService(
+        api_key="test",
+        models=["a:free", "b:free"],
+        transport=httpx.MockTransport(handler),
+        quota=lambda ip, day, ip_cap, global_cap: {"allowed": True},
+    )
+    with pytest.raises(AssistantError) as error:
+        service.chat(
+            {"messages": [{"role": "user", "content": "Which milestone is blocked?"}]},
+            "127.0.0.1",
+        )
+    assert error.value.code == "upstream_timeout"
+    assert error.value.status == 503
+
+
+def test_the_total_deadline_stops_extra_model_attempts():
+    records: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        records.append(body["model"])
+        raise httpx.ReadTimeout("slow")
+
+    service = AssistantService(
+        api_key="test",
+        models=["a:free", "b:free", "c:free"],
+        transport=httpx.MockTransport(handler),
+        quota=lambda ip, day, ip_cap, global_cap: {"allowed": True},
+        attempt_timeout=5,
+        total_timeout=0.01,
+    )
+    with pytest.raises(AssistantError) as error:
+        service.chat(
+            {"messages": [{"role": "user", "content": "Which milestone is blocked?"}]},
+            "127.0.0.1",
+        )
+    assert error.value.code == "upstream_timeout"
+    assert len(records) <= 1
+
+def test_the_default_free_model_order_starts_with_the_faster_model():
+    from backend.assistant import DEFAULT_FREE_MODELS
+
+    assert DEFAULT_FREE_MODELS[0] == "google/gemma-4-26b-a4b-it:free"
+    assert all(model.endswith(":free") for model in DEFAULT_FREE_MODELS)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 from concurrent.futures import ThreadPoolExecutor
@@ -51,6 +52,7 @@ ROOT = Path(__file__).resolve().parent.parent
 PUBLIC = ROOT / "public"
 DIST = ROOT / "frontend" / "dist"
 T = TypeVar("T")
+logger = logging.getLogger(__name__)
 
 
 class ProjectCreate(BaseModel):
@@ -445,6 +447,17 @@ def create_app(
                 status_code=exc.status,
                 content={"detail": {"code": exc.code, "message": exc.message}},
             )
+        except Exception:
+            logger.exception("assistant request failed")
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "detail": {
+                        "code": "assistant_internal",
+                        "message": "The assistant failed unexpectedly. Try again shortly.",
+                    }
+                },
+            )
         return JSONResponse(completion)
 
     @app.post("/api/assistant/chat/completions", include_in_schema=False)
@@ -452,14 +465,37 @@ def create_app(
         try:
             completion = app.state.assistant.chat(payload, _client_ip(request))
         except AssistantError as exc:
-            return Response(
-                content=exc.message,
+            return JSONResponse(
                 status_code=exc.status,
-                media_type="text/plain",
+                content={"detail": {"code": exc.code, "message": exc.message}},
                 headers={"X-WorkGraph-Error": exc.code},
             )
+        except Exception:
+            logger.exception("assistant SSE request failed")
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "detail": {
+                        "code": "assistant_internal",
+                        "message": "The assistant failed unexpectedly. Try again shortly.",
+                    }
+                },
+            )
+        try:
+            body = completion_to_sse(completion)
+        except Exception:
+            logger.exception("assistant SSE serialization failed")
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "detail": {
+                        "code": "assistant_internal",
+                        "message": "The assistant failed unexpectedly. Try again shortly.",
+                    }
+                },
+            )
         return Response(
-            content=completion_to_sse(completion),
+            content=body,
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-store",

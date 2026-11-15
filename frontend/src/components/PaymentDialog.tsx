@@ -236,7 +236,9 @@ export function PaymentDialog({ invoiceId, onClose, onPaid }: Props) {
               <p className="pay-note">
                 The server creates a PayPal Orders v2 sandbox order, verifies the capture amount,
                 currency and order id, then records one sample ledger payment. It refuses any
-                non-sandbox host. A local mock is labelled MOCK and never calls PayPal.
+                non-sandbox host. A local mock is labelled MOCK and never calls PayPal. After
+                approval, PayPal returns to this app, captures automatically and opens the paid
+                project.
               </p>
               {!paypalOrder && (
                 <button
@@ -280,8 +282,6 @@ export function PaymentDialog({ invoiceId, onClose, onPaid }: Props) {
                       <a
                         className="btn btn-secondary btn-small"
                         href={paypalOrder.approve_url}
-                        target="_blank"
-                        rel="noreferrer"
                       >
                         Open sandbox checkout
                       </a>

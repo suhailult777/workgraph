@@ -28,19 +28,24 @@ from graph.operations import (
     accept_plan,
     agent_state,
     assert_store_integrity,
+    claim_paypal_order,
     complete_milestone,
     consume_assistant_quota,
     create_paypal_order_record,
     create_sample_project,
     decline_path,
+    find_paypal_order_by_capture,
     get_paypal_order_record,
     get_project,
     list_projects,
     mark_paypal_order_captured,
+    payment_result_for_external_id,
     preview_payment,
     record_payment,
+    release_paypal_order,
 )
 from graph.queries import BLOCKED_BY_UNPAID, PAID_SKILL_HISTORY, SUMMARY, UNLOCK_PATHS, rows
+from graph.retrieval import retrieve_context
 
 ROOT = Path(__file__).resolve().parent.parent
 PUBLIC = ROOT / "public"
@@ -212,6 +217,9 @@ def create_app(
         quota=lambda ip, day, ip_cap, global_cap: graph.call(
             lambda conn: consume_assistant_quota(conn, ip, day, ip_cap, global_cap)
         ),
+        retrieve=lambda question: graph.call(
+            lambda conn: retrieve_context(conn, question)
+        ),
     )
     paypal_client = paypal or PayPalClient(
         mock=bool(os.environ.get("PAYPAL_MOCK") == "1" and not _is_production())
@@ -309,6 +317,7 @@ def create_app(
             "graph_ready": ready,
             "assistant_live": assistant_service.configured,
             "paypal_sandbox_configured": paypal_client.configured,
+            "paypal_webhook_configured": paypal_client.webhook_configured,
             "storage_kind": selected_storage.kind,
         }
 
@@ -318,6 +327,7 @@ def create_app(
             "assistant_live": assistant_service.configured,
             "assistant_mock": bool(getattr(assistant_service, "mock", False)),
             "paypal_sandbox_configured": paypal_client.configured,
+            "paypal_webhook_configured": paypal_client.webhook_configured,
             "storage_kind": selected_storage.kind,
             "environment": "production" if _is_production() else "development",
         }
@@ -459,14 +469,29 @@ def create_app(
             },
         )
 
+    def _captured_result(record: dict, *, recovered: bool = False) -> dict:
+        payment = None
+        try:
+            payment = graph.call(
+                lambda conn: payment_result_for_external_id(conn, record["id"])
+            )
+        except Exception:
+            payment = None
+        result = {
+            "already_captured": True,
+            "order": record,
+            "payment_id": record.get("payment_id"),
+            "capture_id": record.get("capture_id"),
+            "payment": payment,
+        }
+        if recovered:
+            result["recovered"] = True
+        return result
+
     def capture_paypal_order(order_id: str) -> dict:
         record = graph.call(lambda conn: get_paypal_order_record(conn, order_id))
         if record["status"] == "CAPTURED":
-            return {
-                "already_captured": True,
-                "order": record,
-                "payment_id": record.get("payment_id"),
-            }
+            return _captured_result(record)
         if not paypal_client.configured:
             raise HTTPException(
                 status_code=503,
@@ -475,35 +500,87 @@ def create_app(
                     "message": "PayPal sandbox is not configured on this deployment.",
                 },
             )
-        preview = graph.call(lambda conn: preview_payment(conn, record["invoice_id"]))
-        captured = paypal_client.capture_order(
-            order_id, record["amount_cents"], record["currency"]
-        )
-        capture_id = verify_capture(
-            captured, order_id, record["amount_cents"], record["currency"]
-        )
-        payment = graph.call(
-            lambda conn: record_payment(
-                conn,
-                record["invoice_id"],
-                record["amount_cents"],
-                method="paypal_sandbox",
-                external_id=order_id,
+
+        claim = graph.call(lambda conn: claim_paypal_order(conn, order_id))
+        if not claim.get("claimed"):
+            latest = graph.call(lambda conn: get_paypal_order_record(conn, order_id))
+            if latest["status"] == "CAPTURED":
+                return _captured_result(latest)
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "paypal_capture_in_progress",
+                    "message": "Another capture for this order is still running. Try again shortly.",
+                },
             )
-        )
-        order = graph.call(
-            lambda conn: mark_paypal_order_captured(
-                conn, order_id, payment["payment_id"], capture_id
+
+        try:
+            try:
+                preview = graph.call(
+                    lambda conn: preview_payment(conn, record["invoice_id"])
+                )
+            except GraphError as exc:
+                if exc.code not in {"already_paid", "already_unlocked"}:
+                    raise
+                payment = graph.call(
+                    lambda conn: payment_result_for_external_id(conn, order_id)
+                )
+                if payment is None:
+                    raise
+                order = graph.call(
+                    lambda conn: mark_paypal_order_captured(
+                        conn, order_id, payment["payment_id"], record.get("capture_id") or ""
+                    )
+                )
+                graph.persist()
+                return {
+                    "already_captured": True,
+                    "recovered": True,
+                    "order": order,
+                    "payment_id": payment["payment_id"],
+                    "payment": payment,
+                }
+
+            try:
+                captured = paypal_client.capture_order(
+                    order_id, record["amount_cents"], record["currency"]
+                )
+            except PayPalError as exc:
+                if exc.code != "paypal_capture_conflict":
+                    raise
+                captured = paypal_client.get_order(order_id)
+            capture_id = verify_capture(
+                captured, order_id, record["amount_cents"], record["currency"]
             )
-        )
-        graph.persist()
-        return {
-            "already_captured": False,
-            "order": order,
-            "capture_id": capture_id,
-            "payment": payment,
-            "invoice": preview["invoice"],
-        }
+            payment = graph.call(
+                lambda conn: record_payment(
+                    conn,
+                    record["invoice_id"],
+                    record["amount_cents"],
+                    method="paypal_sandbox",
+                    external_id=order_id,
+                )
+            )
+            order = graph.call(
+                lambda conn: mark_paypal_order_captured(
+                    conn, order_id, payment["payment_id"], capture_id
+                )
+            )
+            graph.persist()
+            return {
+                "already_captured": False,
+                "order": order,
+                "capture_id": capture_id,
+                "payment": payment,
+                "invoice": preview["invoice"],
+            }
+        except Exception as exc:
+            try:
+                graph.call(lambda conn: release_paypal_order(conn, order_id, type(exc).__name__))
+                graph.persist()
+            except Exception:
+                pass
+            raise
 
     @app.post("/api/paypal/orders", status_code=201)
     def paypal_create_order(body: PayPalOrderCreate, request: Request) -> dict:
@@ -521,7 +598,7 @@ def create_app(
             preview["amount_cents"],
             "USD",
             body.invoice_id,
-            body.return_url or f"{base}/#/projects/{preview['project']['id']}",
+            body.return_url or f"{base}/paypal/return",
             body.cancel_url or f"{base}/#/projects/{preview['project']['id']}",
         )
         record = graph.call(
@@ -553,9 +630,13 @@ def create_app(
     @app.post("/api/paypal/webhook")
     async def paypal_webhook(request: Request) -> dict:
         raw = await request.body()
+        if not paypal_client.webhook_configured:
+            return {
+                "ok": True,
+                "skipped": "webhook_id_not_configured",
+                "message": "Set PAYPAL_WEBHOOK_ID to verify PayPal webhook signatures.",
+            }
         verified = paypal_client.verify_webhook(dict(request.headers), raw)
-        if verified is None:
-            return {"ok": True, "skipped": "webhook_id_not_configured"}
         if not verified:
             raise HTTPException(
                 status_code=400,
@@ -568,19 +649,40 @@ def create_app(
                 status_code=400,
                 detail={"code": "paypal_webhook_invalid", "message": "Webhook body is not JSON."},
             ) from exc
+        if not isinstance(event, dict):
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "paypal_webhook_invalid", "message": "Webhook body is not an object."},
+            )
         if event.get("event_type") != "PAYMENT.CAPTURE.COMPLETED":
             return {"ok": True, "ignored": event.get("event_type")}
         resource = event.get("resource") or {}
         order_id = (
             (resource.get("supplementary_data") or {}).get("related_ids", {}).get("order_id")
-            or resource.get("id")
+            or resource.get("order_id")
         )
+        if not order_id and resource.get("id"):
+            order_id = graph.call(
+                lambda conn: find_paypal_order_by_capture(conn, str(resource["id"]))
+            )
         if not order_id:
             raise HTTPException(
                 status_code=400,
                 detail={"code": "paypal_webhook_invalid", "message": "Webhook has no order id."},
             )
-        return capture_paypal_order(order_id)
+        try:
+            graph.call(lambda conn: get_paypal_order_record(conn, order_id))
+        except GraphError as exc:
+            if exc.status == 404:
+                return {"ok": True, "ignored": "unknown_order", "order_id": order_id}
+            raise
+        try:
+            return capture_paypal_order(order_id)
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            if exc.status_code == 409 and detail.get("code") == "paypal_capture_in_progress":
+                return {"ok": True, "processing": True, "order_id": order_id}
+            raise
 
     @app.post("/api/demo/llm/chat/completions", include_in_schema=False)
     def demo_chat(payload: dict) -> Response:
@@ -662,6 +764,16 @@ def create_app(
     @app.get("/page-bridge.js", include_in_schema=False)
     def page_bridge() -> FileResponse:
         return FileResponse(PUBLIC / "page-bridge.js", media_type="application/javascript")
+
+    @app.get("/paypal/return", include_in_schema=False)
+    def paypal_return_page():
+        index = DIST / "index.html"
+        if not index.exists():
+            return JSONResponse(
+                status_code=404,
+                content={"detail": {"code": "frontend_missing", "message": "Build the frontend first."}},
+            )
+        return FileResponse(index, media_type="text/html")
 
     if (PUBLIC / "runtime").is_dir():
         app.mount(

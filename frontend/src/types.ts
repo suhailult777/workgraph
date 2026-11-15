@@ -13,6 +13,7 @@ export type Payment = {
   invoice: string;
   amount_cents: number;
   method: string;
+  external_id: string | null;
   recorded_at: string | null;
 };
 
@@ -129,6 +130,7 @@ export type Health = {
   graph_ready: boolean;
   assistant_live: boolean;
   paypal_sandbox_configured: boolean;
+  paypal_webhook_configured: boolean;
   storage_kind: string;
 };
 
@@ -136,6 +138,7 @@ export type AppConfig = {
   assistant_live: boolean;
   assistant_mock: boolean;
   paypal_sandbox_configured: boolean;
+  paypal_webhook_configured: boolean;
   storage_kind: string;
   environment: "production" | "development" | string;
 };

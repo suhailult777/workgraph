@@ -112,7 +112,7 @@ export function Board({ projects, loading, error, creating, createError, onCreat
             Milestones, invoices and sample payments in one graph. Read the dependency path,
             record a sample payment, and watch the unlock edge appear. No agent required.
           </p>
-          <p className="hero-note">Sample money only. No cards, no PayPal, no live model.</p>
+          <p className="hero-note">Sample money only. PayPal sandbox, no cards, no live money.</p>
         </div>
       </section>
 

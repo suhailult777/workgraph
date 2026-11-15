@@ -4,18 +4,20 @@ WorkGraph is a new open agentic website for freelance work: projects, milestone
 dependencies, invoices and sample payments live in a persistent Relate graph.
 People and browser agents read and change the same graph.
 
-**Status: Phase 1, milestone 4 (1-4 Dec 2026).** Deployable to Vercel Hobby.
-Local checks pass. Nothing was pushed or deployed by this task. The human UI,
-graph operations, browser assistant, live server assistant, sandbox PayPal and
-durable Blob snapshot path are in place. Production refuses demo mode.
+**Status: Phase 1, milestone 5 (15 Nov 2026).** Local checks pass. Nothing was
+pushed or deployed by this task. The human UI, graph operations, browser
+assistant, live server assistant with graph retrieval and citations, sandbox
+PayPal checkout with a return-to-app capture, webhook signature verification and
+the durable Blob snapshot path are in place. Production refuses demo mode.
 
 ## What is here
 
 | Path | Purpose |
 | --- | --- |
 | `backend/app.py` | FastAPI: health, config, projects, payments, milestones, assistant, PayPal sandbox, artifacts, React build |
-| `backend/assistant.py` | Server-side OpenRouter free-model proxy with per-IP and global daily caps |
-| `backend/paypal.py` | PayPal Orders v2 sandbox client, capture verification and webhook check |
+| `backend/assistant.py` | Server-side OpenRouter free-model proxy with per-IP and global daily caps, graph context and citation checks |
+| `backend/paypal.py` | PayPal Orders v2 sandbox client, capture verification, idempotent claims and webhook signature check |
+| `graph/retrieval.py` | Scores graph nodes against a question, expands one hop and builds the cited context block |
 | `backend/storage.py` | Local file or Vercel Blob snapshot with ETag compare-and-swap |
 | `vercel.json` | Vercel build, Python function, static public artifacts and CORS headers |
 | `pyproject.toml` | Vercel FastAPI entrypoint and static CDN settings |
@@ -121,9 +123,11 @@ API as the page.
 - **Not registered:** `record_sample_payment`, `unlock_deliverable` and any
   card-charge tool. The assistant cannot charge a card, take real money, send
   email or call live PayPal.
-- **Grounding:** instructions require a node id or invoice number for every
-  project, milestone, invoice and payment fact. Answers that have no tool fact
-  say they do not know.
+- **Grounding:** the server retrieves the matching nodes and edges from Relate
+  for the question, inserts that context as a system message, and checks the
+  reply for node ids or titles. If the model omits sources, the server appends a
+  short `Sources:` line from the retrieved nodes. A question with no matching
+  node returns `not in the graph` without calling the provider.
 - **Live mode:** when `/api/config` reports `assistant_live: true`, the browser
   boots the runtime against `/api/assistant`. The server calls OpenRouter with
   an allowlist of model ids ending in `:free`, falls back to the next free model
@@ -155,6 +159,7 @@ milestone names and dependencies, no amounts, and has **Accept plan** and
   "assistant_live": true,
   "assistant_mock": false,
   "paypal_sandbox_configured": true,
+  "paypal_webhook_configured": true,
   "storage_kind": "vercel_blob",
   "environment": "production"
 }
@@ -173,15 +178,22 @@ milestone names and dependencies, no amounts, and has **Accept plan** and
 
 The payment dialog has a separate **PayPal sandbox checkout** section.
 
-1. The server previews the invoice and creates an Orders v2 sandbox order.
-2. The visitor approves in the sandbox, then the browser asks the server to
-   capture it.
+1. The server previews the invoice and creates an Orders v2 sandbox order with
+   `/paypal/return` as the return URL.
+2. The visitor approves in the sandbox. PayPal redirects back with
+   `?token=<order id>`; the app captures automatically and opens the paid
+   project.
 3. The server verifies the order id, `COMPLETED` status, amount and currency
    before calling `record_payment` with method `paypal_sandbox`.
 4. A second capture of the same order returns `already_captured` and does not
-   create a second payment.
-5. `POST /api/paypal/webhook` verifies with `PAYPAL_WEBHOOK_ID` and skips
-   gracefully when the id is unset.
+   create a second payment. An atomic `PayPalOrder` claim stops a browser and a
+   webhook from capturing at the same time, and the ledger is also idempotent by
+   `external_id`.
+5. `POST /api/paypal/webhook` verifies signatures through PayPal's
+   `verify-webhook-signature` API whenever `PAYPAL_WEBHOOK_ID` is set, rejects
+   bad or missing signatures with 400, and records `PAYMENT.CAPTURE.COMPLETED`
+   once. With no webhook id it returns `skipped: "webhook_id_not_configured"`
+   and a clear message. The exact sandbox setup is in `docs/DEPLOY.md`.
 
 The client refuses every host except `api-m.sandbox.paypal.com`. `PAYPAL_MOCK=1`
 returns a labelled `MOCK-` order for local tests and screenshots; production
@@ -254,6 +266,7 @@ actions call the same functions.
 | Record sample payment | `POST /api/payments` | Amount must equal the invoice in integer cents; one new `Payment`, `PAID_BY` and `UNLOCKS` edges only for that milestone's deliverables |
 | PayPal sandbox order | `POST /api/paypal/orders` | Sandbox host only; stores the order id with the invoice |
 | PayPal capture | `POST /api/paypal/orders/{id}/capture` | Verifies order id, COMPLETED status, amount and currency; second capture is a no-op |
+| PayPal webhook | `POST /api/paypal/webhook` | Verifies the PayPal signature when `PAYPAL_WEBHOOK_ID` is set; records a completed capture once |
 | Mark milestone done | `POST /api/milestones/{id}/complete` | Refused with 409 when blocked or when its invoice is still `SENT` |
 
 A failed operation rolls back. Tests cover wrong amounts, a second payment,
@@ -390,6 +403,9 @@ Result: `Build` and `Handover` both wait on `Design system` (invoice `WG-1002`,
 - [`docs/shots/p1m4-checkout.png`](docs/shots/p1m4-checkout.png): labelled mock PayPal sandbox checkout.
 - [`docs/shots/p1m4-mobile.png`](docs/shots/p1m4-mobile.png): board at 390 with a compact graph-ready status.
 - [`docs/shots/p1m4-production-not-configured.png`](docs/shots/p1m4-production-not-configured.png): production mode with no key, showing NOT CONFIGURED instead of a demo.
+- [`docs/shots/p1m5-sandbox-order.png`](docs/shots/p1m5-sandbox-order.png): labelled mock PayPal sandbox order ready for approval.
+- [`docs/shots/p1m5-payment-paid.png`](docs/shots/p1m5-payment-paid.png): paid project after the return capture, with the PayPal sandbox payment in the ledger.
+- [`docs/shots/p1m5-assistant-citations.png`](docs/shots/p1m5-assistant-citations.png): grounded assistant answer with node ids.
 
 ## Limits
 

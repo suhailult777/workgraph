@@ -167,3 +167,43 @@ def test_mock_mode_never_calls_the_network():
     assert order["id"].startswith("MOCK-")
     captured = client.capture_order(order["id"], 240000, "USD")
     assert verify_capture(captured, order["id"], 240000, "USD") == f"CAP-{order['id']}"
+
+def test_a_capture_conflict_is_mapped_and_missing_headers_are_rejected():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/oauth2/token":
+            return httpx.Response(200, json={"access_token": "sandbox-token"})
+        if request.url.path.endswith("/capture"):
+            return httpx.Response(
+                422,
+                json={
+                    "name": "UNPROCESSABLE_ENTITY",
+                    "details": [{"issue": "ORDER_ALREADY_CAPTURED"}],
+                },
+            )
+        if request.url.path == "/v1/notifications/verify-webhook-signature":
+            return httpx.Response(200, json={"verification_status": "FAILURE"})
+        return httpx.Response(404, json={"error": "not found"})
+
+    client = PayPalClient(
+        "id", "secret", webhook_id="WH-1", transport=httpx.MockTransport(handler)
+    )
+    with pytest.raises(PayPalError) as error:
+        client.capture_order("ORDER-1", 240000, "USD")
+    assert error.value.code == "paypal_capture_conflict"
+
+    headers = {
+        "paypal-transmission-id": "t-1",
+        "paypal-transmission-time": "2026-11-13T00:00:00Z",
+        "paypal-cert-url": "https://api.paypal.com/cert",
+        "paypal-auth-algo": "SHA256withRSA",
+        "paypal-transmission-sig": "sig",
+    }
+    assert client.verify_webhook(headers, b"{}") is False
+    assert client.verify_webhook({}, b"{}") is False
+    assert client.webhook_configured is True
+
+
+def test_webhook_id_unset_is_not_configured():
+    client = PayPalClient("id", "secret", webhook_id="")
+    assert client.webhook_configured is False
+    assert client.verify_webhook({}, b"{}") is None

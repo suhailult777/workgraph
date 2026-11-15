@@ -296,7 +296,8 @@ def _load_project(conn, project_id: str) -> dict:
         "RETURN m.id AS milestone_id, i.id AS id, i.number AS number, "
         "i.status AS status, i.amount_cents AS amount_cents, "
         "pay.id AS payment_id, pay.amount_cents AS payment_amount, "
-        "pay.method AS method, pay.recorded_at AS recorded_at "
+        "pay.method AS method, pay.external_id AS external_id, "
+        "pay.recorded_at AS recorded_at "
         "ORDER BY i.number",
         {"id": project_id},
     )
@@ -318,6 +319,7 @@ def _load_project(conn, project_id: str) -> dict:
                     "invoice": row["number"],
                     "amount_cents": row["payment_amount"],
                     "method": row["method"],
+                    "external_id": row["external_id"],
                     "recorded_at": row["recorded_at"],
                 }
             )
@@ -559,7 +561,11 @@ def _load_project(conn, project_id: str) -> dict:
                     {
                         "id": payment["id"],
                         "kind": "Payment",
-                        "label": "Sample payment",
+                        "label": (
+                            "PayPal sandbox payment"
+                            if payment["method"] == "paypal_sandbox"
+                            else "Sample payment"
+                        ),
                         "status": "PAID",
                         "amount_cents": payment["amount_cents"],
                         "meta": payment["method"],
@@ -935,7 +941,8 @@ def get_paypal_order_record(conn, order_id: str) -> dict:
         "MATCH (o:PayPalOrder {id: $id}) RETURN o.id AS id, o.invoice_id AS invoice_id, "
         "o.amount_cents AS amount_cents, o.currency AS currency, o.status AS status, "
         "o.approve_url AS approve_url, o.payment_id AS payment_id, "
-        "o.capture_id AS capture_id, o.created_at AS created_at",
+        "o.capture_id AS capture_id, o.created_at AS created_at, "
+        "o.capture_started_at AS capture_started_at, o.capture_error AS capture_error",
         {"id": order_id},
     )
     if not rows:
@@ -943,14 +950,105 @@ def get_paypal_order_record(conn, order_id: str) -> dict:
     return rows[0]
 
 
-def mark_paypal_order_captured(conn, order_id: str, payment_id: str, capture_id: str) -> dict:
+def claim_paypal_order(conn, order_id: str) -> dict:
+    """Atomically move one order from CREATED to CAPTURING.
+
+    Two concurrent captures (browser and webhook) cannot both win. The loser
+    gets ``claimed=False`` and either the captured record or a busy marker.
+    """
+    with transaction(conn):
+        rows = _fetch(
+            conn,
+            "MATCH (o:PayPalOrder {id: $id}) RETURN o.status AS status",
+            {"id": order_id},
+        )
+        if not rows:
+            raise GraphError("not_found", f"PayPal order {order_id} was not found.", 404)
+        status = rows[0]["status"]
+        if status in {"CAPTURED", "CAPTURING"}:
+            return {"claimed": False, "busy": status == "CAPTURING", "status": status}
+        if status != "CREATED":
+            raise GraphError(
+                "paypal_order_state",
+                f"PayPal order {order_id} is {status}, not CREATED.",
+            )
+        conn.execute(
+            "MATCH (o:PayPalOrder {id: $id}) SET o.status = 'CAPTURING', "
+            "o.capture_started_at = $at, o.capture_error = null",
+            {"id": order_id, "at": _now()},
+        )
+    return {"claimed": True, "busy": False, "status": "CAPTURING"}
+
+
+def release_paypal_order(conn, order_id: str, reason: str = "") -> None:
     with transaction(conn):
         conn.execute(
-            "MATCH (o:PayPalOrder {id: $id}) SET o.status = 'CAPTURED', "
-            "o.payment_id = $payment, o.capture_id = $capture, o.captured_at = $at",
-            {"id": order_id, "payment": payment_id, "capture": capture_id, "at": _now()},
+            "MATCH (o:PayPalOrder {id: $id}) WHERE o.status = 'CAPTURING' "
+            "SET o.status = 'CREATED', o.capture_error = $reason",
+            {"id": order_id, "reason": reason[:300]},
         )
+
+
+def mark_paypal_order_captured(conn, order_id: str, payment_id: str, capture_id: str) -> dict:
+    with transaction(conn):
+        rows = _fetch(
+            conn,
+            "MATCH (o:PayPalOrder {id: $id}) RETURN o.status AS status",
+            {"id": order_id},
+        )
+        if not rows:
+            raise GraphError("not_found", f"PayPal order {order_id} was not found.", 404)
+        if rows[0]["status"] != "CAPTURED":
+            if rows[0]["status"] not in {"CREATED", "CAPTURING"}:
+                raise GraphError(
+                    "paypal_order_state",
+                    f"PayPal order {order_id} is {rows[0]['status']}, not capturable.",
+                )
+            conn.execute(
+                "MATCH (o:PayPalOrder {id: $id}) SET o.status = 'CAPTURED', "
+                "o.payment_id = $payment, o.capture_id = $capture, o.captured_at = $at, "
+                "o.capture_error = null",
+                {"id": order_id, "payment": payment_id, "capture": capture_id, "at": _now()},
+            )
     return get_paypal_order_record(conn, order_id)
+
+
+def find_paypal_order_by_capture(conn, capture_id: str) -> str | None:
+    rows = _fetch(
+        conn,
+        "MATCH (o:PayPalOrder {capture_id: $capture}) RETURN o.id AS id",
+        {"capture": capture_id},
+    )
+    return rows[0]["id"] if rows else None
+
+
+def payment_result_for_external_id(conn, external_id: str) -> dict | None:
+    """Build the same PaymentResult shape for an existing external payment."""
+    rows = _fetch(
+        conn,
+        "MATCH (i:Invoice)-[:PAID_BY]->(p:Payment {external_id: $ext}) "
+        "MATCH (i)<-[:INVOICED]-(m:Milestone)<-[:HAS_MILESTONE]-(proj:Project) "
+        "RETURN p.id AS payment_id, p.amount_cents AS amount_cents, "
+        "i.id AS invoice_id, m.id AS milestone_id, proj.id AS project_id",
+        {"ext": external_id},
+    )
+    if not rows:
+        return None
+    row = rows[0]
+    unlocked = _fetch(
+        conn,
+        "MATCH (p:Payment {id: $id})-[:UNLOCKS]->(d:Deliverable) "
+        "RETURN d.id AS id, d.name AS name ORDER BY d.name",
+        {"id": row["payment_id"]},
+    )
+    return {
+        "payment_id": row["payment_id"],
+        "invoice_id": row["invoice_id"],
+        "milestone_id": row["milestone_id"],
+        "amount_cents": row["amount_cents"],
+        "unlocked": unlocked,
+        "project": get_project(conn, row["project_id"]),
+    }
 
 
 def preview_payment(conn, invoice_id: str) -> dict:
@@ -1022,6 +1120,16 @@ def record_payment(
         or amount_cents <= 0
     ):
         raise GraphError("invalid_amount", "Amount must be a positive integer number of cents.", 422)
+
+    if external_id:
+        existing = payment_result_for_external_id(conn, external_id)
+        if existing is not None:
+            if existing["invoice_id"] != invoice_id or existing["amount_cents"] != amount_cents:
+                raise GraphError(
+                    "payment_conflict",
+                    f"External payment {external_id} is already recorded for another invoice or amount.",
+                )
+            return existing
 
     preview = preview_payment(conn, invoice_id)
     if amount_cents != preview["amount_cents"]:

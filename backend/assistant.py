@@ -14,6 +14,8 @@ from typing import Any, Callable
 
 import httpx
 
+from graph.retrieval import citations_for, source_line
+
 DEFAULT_FREE_MODELS = (
     "google/gemma-4-31b-it:free",
     "nvidia/nemotron-3-ultra-550b-a55b:free",
@@ -56,6 +58,51 @@ def _completion(model: str, content: str, tool_calls: list[dict] | None = None) 
         "choices": [{"index": 0, "message": message, "finish_reason": finish}],
         "usage": None,
     }
+
+
+def _message_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return " ".join(
+            str(item.get("text") or "") if isinstance(item, dict) else str(item)
+            for item in value
+        )
+    return str(value or "")
+
+
+def _last_user_text(messages: list[dict]) -> str:
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            return _message_text(message.get("content")).strip()
+    return ""
+
+
+def _grounded_summary(bundle: dict, question: str = "") -> str:
+    nodes = list(bundle.get("matched") or [])
+    if "who" in question.lower():
+        parties = [
+            node for node in (bundle.get("nodes") or []) if node.get("kind") == "Party"
+        ][:3]
+        nodes = parties + nodes
+    lines = []
+    seen: set[str] = set()
+    for node in nodes:
+        ident = str(node.get("id") or "")
+        if not ident or ident in seen:
+            continue
+        seen.add(ident)
+        bits = [f'[{ident}] "{node["title"]}"']
+        if node.get("kind"):
+            bits.append(node["kind"])
+        if node.get("status"):
+            bits.append(str(node["status"]))
+        if node.get("amount_cents") is not None:
+            bits.append(f'{node["amount_cents"]} cents')
+        lines.append(" ".join(bits))
+        if len(lines) >= 5:
+            break
+    return "From the graph: " + "; ".join(lines) + "."
 
 
 def completion_to_sse(completion: dict) -> str:
@@ -121,12 +168,14 @@ class AssistantService:
         mock: bool = False,
         ip_cap: int | None = None,
         global_cap: int | None = None,
+        retrieve: Callable[[str], dict] | None = None,
     ):
         self.api_key = api_key if api_key is not None else os.environ.get("OPENROUTER_API_KEY", "")
         self.models = models or free_models()
         self.quota = quota
         self.transport = transport
         self.mock = mock
+        self.retrieve = retrieve
         self.ip_cap = ip_cap if ip_cap is not None else int(os.environ.get("ASSISTANT_IP_DAILY_CAP", "20"))
         self.global_cap = (
             global_cap
@@ -227,9 +276,25 @@ class AssistantService:
         start = allowed.index(requested) if requested in allowed else 0
         ordered = allowed[start:] + allowed[:start]
 
+        question = _last_user_text(messages)
+        bundle = self._retrieve(question)
+        if bundle is not None and not bundle.get("matched"):
+            return self._with_grounding(
+                _completion(
+                    ordered[0],
+                    "not in the graph. I could not find a matching project, milestone, "
+                    "invoice, payment, deliverable, party or skill.",
+                ),
+                bundle,
+            )
+
         if self.mock:
             from backend.demo_llm import demo_reply
 
+            if bundle and bundle.get("matched"):
+                return self._with_grounding(
+                    _completion(ordered[0], _grounded_summary(bundle, question)), bundle
+                )
             reply = demo_reply(payload)
             tool_call = reply.get("tool_call")
             if tool_call:
@@ -249,18 +314,73 @@ class AssistantService:
                 )
             return _completion(ordered[0], reply.get("content") or "")
 
+        upstream_messages = self._with_context(messages, bundle)
         for model in ordered:
             try:
-                data = self._upstream(model, messages, tools)
+                data = self._upstream(model, upstream_messages, tools)
             except _RetryModel:
                 continue
             data.setdefault("model", model)
-            return data
+            return self._with_grounding(data, bundle)
         raise AssistantError(
             "upstream_unavailable",
             "Every free assistant model is busy or unavailable. Try again shortly.",
             502,
         )
+
+    def _retrieve(self, question: str) -> dict | None:
+        if self.retrieve is None or not question:
+            return None
+        try:
+            bundle = self.retrieve(question)
+        except Exception as exc:
+            raise AssistantError(
+                "graph_unavailable",
+                "The graph could not be read, so the assistant will not answer without sources.",
+                503,
+            ) from exc
+        return bundle if isinstance(bundle, dict) else None
+
+    def _with_context(self, messages: list[dict], bundle: dict | None) -> list[dict]:
+        if not bundle or not bundle.get("context"):
+            return messages
+        context = (
+            f"{bundle['context']}\n\n"
+            "Use this context for any direct answer. If a tool is needed, call the tool "
+            "first and then cite the returned node ids."
+        )
+        insert_at = 0
+        while insert_at < len(messages) and messages[insert_at].get("role") == "system":
+            insert_at += 1
+        return [
+            *messages[:insert_at],
+            {"role": "system", "content": context},
+            *messages[insert_at:],
+        ]
+
+    def _with_grounding(self, completion: dict, bundle: dict | None) -> dict:
+        if bundle is None:
+            return completion
+        if not bundle.get("matched"):
+            completion["workgraph"] = {"retrieved": [], "citations": []}
+            return completion
+        choice = (completion.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        content = message.get("content") or ""
+        citations: list[dict] = []
+        if content and not message.get("tool_calls"):
+            citations = citations_for(content, bundle)
+            if not citations:
+                line = source_line(bundle)
+                if line:
+                    content = f"{content.rstrip()}\n\n{line}"
+                    message["content"] = content
+                    citations = citations_for(content, bundle)
+        completion["workgraph"] = {
+            "retrieved": bundle.get("matched") or [],
+            "citations": citations,
+        }
+        return completion
 
 
 class _RetryModel(Exception):

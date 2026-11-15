@@ -136,3 +136,107 @@ def test_tool_calls_are_returned_as_sse_deltas():
     assert "website_get_graph_state" in body
     assert '"finish_reason": "tool_calls"' in body
     assert body.endswith("data: [DONE]\n\n")
+
+def bundle_for(*ids):
+    nodes = [
+        {
+            "id": "inv-h2",
+            "kind": "Invoice",
+            "title": "WG-1002",
+            "status": "SENT",
+            "amount_cents": 240000,
+        },
+        {
+            "id": "ms-h3",
+            "kind": "Milestone",
+            "title": "Build",
+            "status": "BLOCKED",
+            "amount_cents": 320000,
+        },
+    ]
+    matched = [node for node in nodes if node["id"] in ids] or nodes
+    return {
+        "matched": matched,
+        "nodes": nodes,
+        "edges": [],
+        "terms": [],
+        "context": "Graph context: " + ", ".join(node["id"] for node in nodes),
+    }
+
+
+def test_graph_context_is_added_and_missing_sources_are_appended():
+    records: list[dict] = []
+    service = AssistantService(
+        api_key="test",
+        models=["a:free"],
+        transport=httpx.MockTransport(handler_for(records)),
+        quota=lambda ip, day, ip_cap, global_cap: {"allowed": True},
+        retrieve=lambda question: bundle_for("inv-h2"),
+    )
+    completion = service.chat(
+        {"messages": [{"role": "user", "content": "Which invoice blocks Build?"}]},
+        "127.0.0.1",
+    )
+    sent = records[0]["messages"]
+    assert any(
+        message["role"] == "system" and "Graph context" in message["content"]
+        for message in sent
+    )
+    content = completion["choices"][0]["message"]["content"]
+    assert "Sources: [inv-h2]" in content
+    assert completion["workgraph"]["citations"][0]["id"] == "inv-h2"
+
+
+def test_a_question_with_no_graph_match_is_answered_without_a_provider_call():
+    called = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(500, json={"error": "should not run"})
+
+    service = AssistantService(
+        api_key="test",
+        models=["a:free"],
+        transport=httpx.MockTransport(handler),
+        quota=lambda ip, day, ip_cap, global_cap: {"allowed": True},
+        retrieve=lambda question: {"matched": [], "nodes": [], "edges": [], "context": ""},
+    )
+    completion = service.chat(
+        {"messages": [{"role": "user", "content": "What is the capital of France?"}]},
+        "127.0.0.1",
+    )
+    assert called is False
+    content = completion["choices"][0]["message"]["content"]
+    assert content.startswith("not in the graph")
+
+
+def test_mock_mode_returns_a_cited_graph_summary():
+    service = AssistantService(
+        mock=True,
+        models=["a:free"],
+        quota=lambda ip, day, ip_cap, global_cap: {"allowed": True},
+        retrieve=lambda question: bundle_for("ms-h3"),
+    )
+    completion = service.chat(
+        {"messages": [{"role": "user", "content": "Which milestone is blocked?"}]},
+        "127.0.0.1",
+    )
+    content = completion["choices"][0]["message"]["content"]
+    assert "[ms-h3]" in content
+    assert completion["workgraph"]["citations"]
+
+def test_a_retrieval_failure_refuses_to_answer_without_sources():
+    service = AssistantService(
+        api_key="test",
+        models=["a:free"],
+        quota=lambda ip, day, ip_cap, global_cap: {"allowed": True},
+        retrieve=lambda question: (_ for _ in ()).throw(RuntimeError("store down")),
+    )
+    with pytest.raises(AssistantError) as error:
+        service.chat(
+            {"messages": [{"role": "user", "content": "Which invoice is open?"}]},
+            "127.0.0.1",
+        )
+    assert error.value.code == "graph_unavailable"
+    assert error.value.status == 503

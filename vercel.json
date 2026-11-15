@@ -74,6 +74,7 @@
   ],
   "rewrites": [
     { "source": "/projects/:path*", "destination": "/index.html" },
-    { "source": "/assistant", "destination": "/index.html" }
+    { "source": "/assistant", "destination": "/index.html" },
+    { "source": "/paypal/return", "destination": "/index.html" }
   ]
 }

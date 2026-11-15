@@ -1177,6 +1177,52 @@ h3 {
   font-variant-numeric: tabular-nums;
 }
 
+.payment-history {
+  margin-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.ledger-subhead {
+  margin: 10px 20px 2px;
+  font-size: 9px;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.payment-list {
+  margin: 0;
+  padding: 0 20px;
+  list-style: none;
+}
+
+.payment-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 0;
+  border-top: 1px dashed var(--line);
+}
+
+.payment-list li:first-child {
+  border-top: 0;
+}
+
+.payment-list code {
+  font-size: 11px;
+}
+
+.paypal-return {
+  margin: 40px auto;
+  max-width: 640px;
+}
+
+.paypal-return-note {
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
 .ledger-total {
   display: flex;
   justify-content: space-between;
@@ -2176,7 +2222,8 @@ h3 {
   }
 
   .blocked-list,
-  .ledger-list {
+  .ledger-list,
+  .payment-list {
     padding: 0 16px;
   }
 

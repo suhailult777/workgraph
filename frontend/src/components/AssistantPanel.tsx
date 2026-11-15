@@ -9,6 +9,7 @@ const SAMPLES = [
   { label: "Paid design work", prompt: "Who has been paid for design-system work before?" },
   { label: "Draft a plan", prompt: "Draft a four-step plan for a new brand project." },
   { label: "Record payment", prompt: "Record the sample payment for WG-1002." },
+  { label: "Outside the graph", prompt: "What is the capital of France?" },
   { label: "Card charge?", prompt: "Record a real card payment for the design system." },
 ];
 
@@ -331,9 +332,10 @@ export function AssistantPanel({ config }: { config: AppConfig | null }) {
         if (hiddenKey) hiddenKey.value = "";
         (window as unknown as { __workgraphAssistant?: unknown }).__workgraphAssistant = engine;
         const greeting =
-          "I read the same sample graph as the page. Ask me which milestones are blocked, " +
-          "who was paid for a skill, or for a plan. I can accept a plan or record a sample " +
-          "payment after you confirm the dialog. I cannot charge a card, take real money or send email.";
+          "I read the same sample graph as the page and cite node ids. Ask me which milestones " +
+          "are blocked, who was paid for a skill, or for a plan. If the graph does not hold the " +
+          "answer, I say not in the graph. I can accept a plan or record a sample payment after " +
+          "you confirm the dialog. I cannot charge a card, take real money or send email.";
         const first = host.querySelector("#ns-msgs .ns-msg.bot");
         if (first) first.textContent = greeting;
         setBootOk(true);
@@ -471,9 +473,10 @@ export function AssistantPanel({ config }: { config: AppConfig | null }) {
           <p className="eyebrow">Agentic Web · runs in your browser</p>
           <h2 id="assistant-title">Ask the graph</h2>
           <p className="assistant-lede">
-            The assistant reads the same projects, blocked paths and sample payments as the page.
-            It can accept a plan or record a sample payment after you confirm the dialog. It never
-            charges a card, sends email or moves real money.
+            The assistant retrieves the matching projects, milestones, invoices and sample
+            payments from the same graph as the page, then cites their node ids. If nothing
+            matches, it says not in the graph. It can accept a plan or record a sample payment
+            after you confirm the dialog. It never charges a card, sends email or moves real money.
           </p>
         </div>
         <div className="assistant-mode-box">

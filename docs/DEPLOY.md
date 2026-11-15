@@ -73,6 +73,44 @@ Optional: `BLOB_STORE_PATH` (default `workgraph/workgraph.rl`).
 `PAYPAL_MOCK` and `WORKGRAPH_ASSISTANT_MOCK` are ignored when production is
 detected. Do not set them on Vercel.
 
+## PayPal sandbox webhook
+
+The webhook endpoint is `POST /api/paypal/webhook`. When
+`PAYPAL_WEBHOOK_ID` is set, every request must carry PayPal's transmission
+headers and the server asks PayPal's
+`/v1/notifications/verify-webhook-signature` API before it trusts the event. A
+missing or failed signature is rejected with 400. When the id is unset, the
+endpoint acknowledges the request with `skipped: "webhook_id_not_configured"`
+and a message; it never trusts an unsigned event.
+
+Only `PAYMENT.CAPTURE.COMPLETED` changes the graph. The handler extracts
+`resource.supplementary_data.related_ids.order_id`, finds the local
+`PayPalOrder`, and runs the same capture path as the browser. `PayPalOrder`
+status `CAPTURING` makes a second browser or webhook capture return `409` or
+`processing` instead of writing twice. The ledger payment is also idempotent by
+the external order id.
+
+### Create the sandbox webhook
+
+1. Open <https://developer.paypal.com/dashboard/applications/sandbox> and sign
+   in to the PayPal developer account that owns the sandbox app.
+2. Select the sandbox app whose client id is in `PAYPAL_CLIENT_ID`.
+3. Scroll to **Webhooks** and choose **Add Webhook**.
+4. Webhook URL: `https://<your-deployment>/api/paypal/webhook`.
+5. Event types: tick **PAYMENT.CAPTURE.COMPLETED** only. Do not add order,
+   refund or dispute events for this milestone.
+6. Save the webhook, then copy the **Webhook ID** that PayPal shows.
+7. Add it to the Vercel project as `PAYPAL_WEBHOOK_ID` for Production, then
+   redeploy. Do not put the id in the repository.
+8. Check `GET /api/config`: `paypal_webhook_configured` must be `true`.
+9. Use PayPal's **Webhooks simulator** with `PAYMENT.CAPTURE.COMPLETED` and a
+   real sandbox capture id, or complete one sandbox checkout and confirm the
+   ledger has exactly one `paypal_sandbox` payment.
+
+If the deployment is behind a proxy, keep the raw body untouched. The endpoint
+reads `request.body()` before parsing so the event object sent for verification
+matches PayPal's payload.
+
 ## Exact deploy commands
 
 From `C:\Users\suhai\workgraph`:
@@ -106,14 +144,19 @@ python -m venv .venv
 ## Post-deploy checks
 
 1. `GET /api/config` returns `assistant_live: true`, `assistant_mock: false`,
-   `paypal_sandbox_configured: true`, `storage_kind: "vercel_blob"`,
-   `environment: "production"`.
+   `paypal_sandbox_configured: true`, `paypal_webhook_configured: true`,
+   `storage_kind: "vercel_blob"`, `environment: "production"`.
 2. `GET /api/health` is `ok` and `graph_ready: true`.
 3. `GET /agent-manifest.json` returns 200 with
    `Access-Control-Allow-Origin: *`.
 4. Open `/`, `/api/projects`, a project, the assistant and the payment dialog.
 5. Confirm the LIVE badge and that no demo mode appears.
-6. Run `python scripts/check_conformance --http https://<deployment>`.
+6. Run one sandbox checkout end to end: create the order, approve it with the
+   sandbox buyer, return to `/paypal/return`, and confirm the invoice is PAID
+   with one `paypal_sandbox` payment and the deliverable unlocked.
+7. Repeat the capture or replay the webhook: the ledger must still have one
+   payment.
+8. Run `python scripts/check_conformance --http https://<deployment>`.
 
 ## If a deploy fails
 

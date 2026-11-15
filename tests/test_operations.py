@@ -1,4 +1,4 @@
-"""Invariant tests for the Phase 1 graph operations.
+﻿"""Invariant tests for the Phase 1 graph operations.
 
 Every test runs against a freshly seeded temporary store. The committed
 ``data/workgraph.rl`` is never touched.
@@ -13,6 +13,8 @@ import pytest
 from graph.db import connect
 from graph.operations import (
     PLAN_TEMPLATE,
+    claim_paypal_order,
+    release_paypal_order,
     GraphError,
     accept_plan,
     complete_milestone,
@@ -600,3 +602,32 @@ def test_paypal_payment_records_its_method_and_unlocks_only_the_paid_deliverable
     assert [row["deliverable"] for row in unlocked if row["payment"] == result["payment_id"]] == [
         "del-h2"
     ]
+
+def test_paypal_order_claim_is_atomic_and_releasable(conn):
+    create_paypal_order_record(
+        conn, "ORDER-CLAIM", "inv-h2", 240000, "USD", "https://sandbox.example/approve"
+    )
+    first = claim_paypal_order(conn, "ORDER-CLAIM")
+    assert first["claimed"] is True
+    second = claim_paypal_order(conn, "ORDER-CLAIM")
+    assert second["claimed"] is False
+    assert second["busy"] is True
+
+    release_paypal_order(conn, "ORDER-CLAIM", "test")
+    third = claim_paypal_order(conn, "ORDER-CLAIM")
+    assert third["claimed"] is True
+
+
+def test_an_external_payment_is_idempotent_by_external_id(conn):
+    first = record_payment(conn, "inv-h2", 240000, method="paypal_sandbox", external_id="ORDER-X")
+    second = record_payment(conn, "inv-h2", 240000, method="paypal_sandbox", external_id="ORDER-X")
+    assert second["payment_id"] == first["payment_id"]
+
+    payment_count = conn.execute(
+        "MATCH (p:Payment {external_id: 'ORDER-X'}) RETURN count(p) AS n"
+    ).fetchone()["n"]
+    assert payment_count == 1
+    project = get_project(conn, "proj-harbour")
+    payment = next(item for item in project["payments"] if item["id"] == first["payment_id"])
+    assert payment["method"] == "paypal_sandbox"
+    assert payment["external_id"] == "ORDER-X"

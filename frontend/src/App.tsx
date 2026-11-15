@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ApiError,
+  capturePayPalOrder,
   completeMilestone,
   createSampleProject,
   getConfig,
@@ -22,7 +23,7 @@ import type {
   ProjectSummary,
 } from "./types";
 
-type Route = { view: "board" } | { view: "project"; id: string };
+type Route = { view: "board" } | { view: "project"; id: string } | { view: "paypal"; orderId: string };
 
 function parseHash(): Route {
   const hash = window.location.hash.replace(/^#\/?/, "");
@@ -37,14 +38,33 @@ function parseHash(): Route {
   return { view: "board" };
 }
 
+function parseInitialRoute(): Route {
+  const path = window.location.pathname.replace(/\/+$/, "");
+  if (path === "/paypal/return") {
+    return {
+      view: "paypal",
+      orderId: new URLSearchParams(window.location.search).get("token") || "",
+    };
+  }
+  return parseHash();
+}
+
 function messageOf(reason: unknown): string {
   return reason instanceof ApiError ? reason.message : "Something went wrong. Try again.";
 }
 
 export default function App() {
-  const [route, setRoute] = useState<Route>(() => parseHash());
+  const [route, setRoute] = useState<Route>(() => parseInitialRoute());
   const [health, setHealth] = useState<Health | null>(null);
   const [config, setConfig] = useState<AppConfig | null>(null);
+  const [paypalReturn, setPaypalReturn] = useState<{
+    status: "capturing" | "done" | "error";
+    message: string;
+    projectId?: string;
+  }>({
+    status: "capturing",
+    message: "Checking the PayPal return…",
+  });
 
   const [projects, setProjects] = useState<ProjectSummary[] | null>(null);
   const [projectsLoading, setProjectsLoading] = useState(true);
@@ -88,6 +108,57 @@ export default function App() {
     window.addEventListener("workgraph:graph", onGraphChanged);
     return () => window.removeEventListener("workgraph:graph", onGraphChanged);
   }, []);
+
+  useEffect(() => {
+    if (route.view !== "paypal") return;
+    let live = true;
+    if (!route.orderId) {
+      setPaypalReturn({
+        status: "error",
+        message:
+          "PayPal returned without an order token. Open the project and start the sandbox checkout again.",
+      });
+      return;
+    }
+    setPaypalReturn({
+      status: "capturing",
+      message: "PayPal approved the order. Verifying the sandbox capture and recording one payment…",
+    });
+    capturePayPalOrder(route.orderId)
+      .then((result) => {
+        if (!live) return;
+        if (result.payment) {
+          const projectId = result.payment.project.project.id;
+          window.history.replaceState({}, "", `/#/projects/${projectId}`);
+          handlePaid(result.payment);
+          setPaypalReturn({
+            status: "done",
+            projectId,
+            message: result.already_captured
+              ? "This PayPal order was already captured. No second payment was recorded."
+              : `Sandbox capture ${result.capture_id || ""} recorded. The invoice is paid and the deliverable is unlocked.`,
+          });
+          setRoute({ view: "project", id: projectId });
+          return;
+        }
+        setPaypalReturn({
+          status: result.already_captured ? "done" : "error",
+          message: result.already_captured
+            ? "This order was already captured. The graph already has its payment."
+            : "The sandbox capture completed, but the graph returned no payment payload.",
+        });
+      })
+      .catch((reason: unknown) => {
+        if (!live) return;
+        setPaypalReturn({
+          status: "error",
+          message: `${messageOf(reason)} Open the project and retry the capture if PayPal shows the order as approved.`,
+        });
+      });
+    return () => {
+      live = false;
+    };
+  }, [route]);
 
   useEffect(() => {
     window.scrollTo({ top: 0, behavior: "auto" });
@@ -255,7 +326,47 @@ export default function App() {
       </header>
 
       <main id="main" className="app">
-        {route.view === "board" ? (
+        {route.view === "paypal" ? (
+          <section className="empty-state paypal-return" aria-live="polite">
+            <p className="empty-kicker">PayPal sandbox return</p>
+            <h1>
+              {paypalReturn.status === "capturing"
+                ? "Verifying the capture…"
+                : paypalReturn.status === "done"
+                  ? "Payment recorded"
+                  : "Capture needs attention"}
+            </h1>
+            <p>{paypalReturn.message}</p>
+            {paypalReturn.status === "capturing" ? (
+              <p className="paypal-return-note">
+                Do not close this tab. The server checks the PayPal sandbox order, the amount and
+                the currency before it writes one ledger payment.
+              </p>
+            ) : (
+              <div className="empty-actions">
+                {paypalReturn.projectId ? (
+                  <button
+                    className="btn btn-primary"
+                    type="button"
+                    onClick={() => navigateTo(`/projects/${paypalReturn.projectId}`)}
+                  >
+                    Open the paid project
+                  </button>
+                ) : null}
+                <button
+                  className="btn btn-secondary"
+                  type="button"
+                  onClick={() => {
+                    window.history.replaceState({}, "", "/#/");
+                    setRoute({ view: "board" });
+                  }}
+                >
+                  Back to projects
+                </button>
+              </div>
+            )}
+          </section>
+        ) : route.view === "board" ? (
           <Board
             projects={projects}
             loading={projectsLoading}

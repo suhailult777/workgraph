@@ -364,11 +364,33 @@ export function ProjectView({
                 ))}
               </ul>
             )}
+            {payments.length > 0 && (
+              <div className="payment-history">
+                <p className="ledger-subhead">Payments</p>
+                <ul className="payment-list">
+                  {payments.map((payment) => (
+                    <li key={payment.id}>
+                      <div>
+                        <code>{payment.id}</code>
+                        <span className="ledger-milestone">
+                          {payment.method}
+                          {payment.external_id ? ` · ${payment.external_id}` : ""}
+                        </span>
+                      </div>
+                      <span className="ledger-amount">{money(payment.amount_cents)}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
             <div className="ledger-total">
-              <span>Sample payments recorded</span>
+              <span>Payments recorded</span>
               <strong>{money(paymentTotal)}</strong>
             </div>
-            <p className="aside-note">Method is always <code>sample</code>. No card or live PayPal call.</p>
+            <p className="aside-note">
+              Methods are <code>sample</code> or <code>paypal_sandbox</code>. No card and no live
+              PayPal call.
+            </p>
           </section>
         </aside>
       </div>

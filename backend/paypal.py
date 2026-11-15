@@ -108,6 +108,10 @@ class PayPalClient:
     def configured(self) -> bool:
         return self.mock or bool(self.client_id and self.client_secret)
 
+    @property
+    def webhook_configured(self) -> bool:
+        return bool(self.webhook_id)
+
     def _http(self) -> httpx.Client:
         return httpx.Client(transport=self.transport, timeout=30)
 
@@ -156,9 +160,29 @@ class PayPalClient:
                 json=body,
             )
         if response.status_code >= 400:
+            issue = ""
+            try:
+                error = response.json()
+                if isinstance(error, dict):
+                    details = error.get("details")
+                    if isinstance(details, list) and details:
+                        issue = str(details[0].get("issue") or "")
+            except ValueError:
+                pass
+            if (
+                path.endswith("/capture")
+                and response.status_code == 422
+                and issue == "ORDER_ALREADY_CAPTURED"
+            ):
+                raise PayPalError(
+                    "paypal_capture_conflict",
+                    "PayPal says this order was already captured. Reading the capture instead.",
+                    409,
+                )
+            detail = f" ({issue})" if issue else ""
             raise PayPalError(
                 "paypal_request_failed",
-                f"PayPal sandbox answered {response.status_code}.",
+                f"PayPal sandbox answered {response.status_code}{detail}.",
                 502,
             )
         try:

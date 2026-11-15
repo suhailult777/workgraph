@@ -10,6 +10,7 @@ from backend.paypal import PayPalClient
 from backend.storage import StorageError
 from graph.db import connect
 from graph.operations import PLAN_TEMPLATE, consume_assistant_quota
+from graph.retrieval import retrieve_context
 from graph.seed import seed
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -398,18 +399,25 @@ def test_frontend_build_is_served(client):
     assert "text/html" in response.headers["content-type"]
     assert "<div id=\"root\">" in response.text
 
+    returned = client.get("/paypal/return")
+    assert returned.status_code == 200
+    assert "text/html" in returned.headers["content-type"]
+    assert "<div id=\"root\">" in returned.text
+
 def test_config_reports_booleans_without_secrets(client):
     body = client.get("/api/config").json()
     assert set(body) == {
         "assistant_live",
         "assistant_mock",
         "paypal_sandbox_configured",
+        "paypal_webhook_configured",
         "storage_kind",
         "environment",
     }
     assert isinstance(body["assistant_live"], bool)
     assert isinstance(body["assistant_mock"], bool)
     assert isinstance(body["paypal_sandbox_configured"], bool)
+    assert isinstance(body["paypal_webhook_configured"], bool)
     assert body["storage_kind"] == "local_file"
     assert "secret" not in json.dumps(body).lower()
     assert "key" not in json.dumps(body).lower()
@@ -544,6 +552,50 @@ def test_paypal_webhook_records_a_capture_once(tmp_path):
         assert second.status_code == 200
         assert second.json()["already_captured"] is True
 
+def test_assistant_endpoint_answers_with_cited_graph_nodes(tmp_path):
+    path = tmp_path / "workgraph.rl"
+    with connect(path) as conn:
+        seed(conn)
+        conn.flush()
+    app = create_app(path)
+    app.state.assistant = AssistantService(
+        mock=True,
+        quota=None,
+        retrieve=lambda question: app.state.graph.call(
+            lambda conn: retrieve_context(conn, question)
+        ),
+    )
+    with TestClient(app) as client:
+        body = client.post(
+            "/api/assistant",
+            json={
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Which milestones are blocked until WG-1002 is paid?",
+                    }
+                ]
+            },
+        ).json()
+        content = body["choices"][0]["message"]["content"]
+        assert "[ms-h3]" in content or "[ms-h4]" in content
+        assert body["workgraph"]["retrieved"]
+
+        sse = client.post(
+            "/api/assistant/chat/completions",
+            json={
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Who has been paid for design systems work?",
+                    }
+                ]
+            },
+        )
+        assert sse.status_code == 200
+        assert "[party-" in sse.text or "[skill-design]" in sse.text
+
+
 def test_assistant_models_lists_only_free_ids(client):
     body = client.get("/api/assistant/models").json()
     ids = [item["id"] for item in body["data"]]
@@ -616,3 +668,294 @@ def test_production_ignores_the_demo_flags(tmp_path, monkeypatch):
     assert app.state.paypal.mock is False
     assert answer.status_code == 503
     assert answer.json()["detail"]["code"] == "assistant_not_configured"
+
+def _sandbox_handler(records: list[dict], verify: str = "SUCCESS", capture_value: str = "2400.00"):
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        records.append({"method": request.method, "path": request.url.path})
+        if request.url.path == "/v1/oauth2/token":
+            return httpx.Response(200, json={"access_token": "sandbox-token"})
+        if request.url.path == "/v2/checkout/orders":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "ORDER-LIVE-1",
+                    "status": "CREATED",
+                    "links": [
+                        {"rel": "approve", "href": "https://sandbox.paypal.example/approve"}
+                    ],
+                },
+            )
+        if request.url.path.endswith("/capture"):
+            return httpx.Response(
+                200,
+                json={
+                    "id": "ORDER-LIVE-1",
+                    "status": "COMPLETED",
+                    "purchase_units": [
+                        {
+                            "payments": {
+                                "captures": [
+                                    {
+                                        "id": "CAP-LIVE-1",
+                                        "status": "COMPLETED",
+                                        "amount": {"value": capture_value, "currency_code": "USD"},
+                                    }
+                                ]
+                            }
+                        }
+                    ],
+                },
+            )
+        if request.url.path == "/v1/notifications/verify-webhook-signature":
+            return httpx.Response(200, json={"verification_status": verify})
+        return httpx.Response(404, json={"error": "not found"})
+
+    return handler
+
+
+def test_full_paypal_sandbox_http_flow_persists_one_payment(tmp_path):
+    import httpx
+
+    records: list[dict] = []
+    path = tmp_path / "workgraph.rl"
+    with connect(path) as conn:
+        seed(conn)
+        conn.flush()
+    paypal = PayPalClient(
+        "id", "secret", webhook_id="WH-1", transport=httpx.MockTransport(_sandbox_handler(records))
+    )
+    app = create_app(path, paypal=paypal)
+    with TestClient(app) as client:
+        created = client.post("/api/paypal/orders", json={"invoice_id": "inv-h2"})
+        assert created.status_code == 201
+        body = created.json()
+        assert body["order"]["id"] == "ORDER-LIVE-1"
+        assert body["approve_url"].startswith("https://sandbox.paypal.example/")
+
+        captured = client.post("/api/paypal/orders/ORDER-LIVE-1/capture")
+        assert captured.status_code == 200
+        result = captured.json()
+        assert result["already_captured"] is False
+        assert result["capture_id"] == "CAP-LIVE-1"
+        assert result["payment"]["amount_cents"] == 240000
+        payment_id = result["payment"]["payment_id"]
+
+        project = client.get("/api/projects/proj-harbour").json()
+        invoice = next(item for item in project["invoices"] if item["id"] == "inv-h2")
+        assert invoice["status"] == "PAID"
+        paypal_payments = [item for item in project["payments"] if item["method"] == "paypal_sandbox"]
+        assert len(paypal_payments) == 1
+        assert paypal_payments[0]["external_id"] == "ORDER-LIVE-1"
+
+        again = client.post("/api/paypal/orders/ORDER-LIVE-1/capture")
+        assert again.status_code == 200
+        assert again.json()["already_captured"] is True
+        assert again.json()["payment_id"] == payment_id
+        project = client.get("/api/projects/proj-harbour").json()
+        assert len([item for item in project["payments"] if item["method"] == "paypal_sandbox"]) == 1
+
+        assert any(record["path"] == "/v1/oauth2/token" for record in records)
+        assert [record["path"] for record in records].count("/v2/checkout/orders") == 1
+
+
+def test_paypal_capture_amount_mismatch_keeps_the_invoice_open(tmp_path):
+    import httpx
+
+    path = tmp_path / "workgraph.rl"
+    with connect(path) as conn:
+        seed(conn)
+        conn.flush()
+    paypal = PayPalClient(
+        "id",
+        "secret",
+        transport=httpx.MockTransport(_sandbox_handler([], capture_value="2400.01")),
+    )
+    app = create_app(path, paypal=paypal)
+    with TestClient(app) as client:
+        client.post("/api/paypal/orders", json={"invoice_id": "inv-h2"})
+        captured = client.post("/api/paypal/orders/ORDER-LIVE-1/capture")
+        assert captured.status_code == 409
+        assert captured.json()["detail"]["code"] == "paypal_amount_mismatch"
+        project = client.get("/api/projects/proj-harbour").json()
+        invoice = next(item for item in project["invoices"] if item["id"] == "inv-h2")
+        assert invoice["status"] == "SENT"
+        order = client.get("/api/paypal/orders/ORDER-LIVE-1").json()["order"]
+        assert order["status"] == "CREATED"
+        assert order["capture_error"] == "PayPalError"
+
+
+def test_webhook_rejects_a_failed_signature_and_completes_a_capture_once(tmp_path):
+    import httpx
+
+    path = tmp_path / "workgraph.rl"
+    with connect(path) as conn:
+        seed(conn)
+        conn.flush()
+    paypal = PayPalClient(
+        "id",
+        "secret",
+        webhook_id="WH-1",
+        transport=httpx.MockTransport(_sandbox_handler([], verify="FAILURE")),
+    )
+    app = create_app(path, paypal=paypal)
+    headers = {
+        "paypal-transmission-id": "t-1",
+        "paypal-transmission-time": "2026-11-13T00:00:00Z",
+        "paypal-cert-url": "https://api.paypal.com/cert",
+        "paypal-auth-algo": "SHA256withRSA",
+        "paypal-transmission-sig": "sig",
+        "Content-Type": "application/json",
+    }
+    event = {
+        "event_type": "PAYMENT.CAPTURE.COMPLETED",
+        "resource": {
+            "id": "CAP-LIVE-1",
+            "supplementary_data": {"related_ids": {"order_id": "ORDER-LIVE-1"}},
+        },
+    }
+    with TestClient(app) as client:
+        client.post("/api/paypal/orders", json={"invoice_id": "inv-h2"})
+        bad = client.post("/api/paypal/webhook", content=json.dumps(event), headers=headers)
+        assert bad.status_code == 400
+        assert bad.json()["detail"]["code"] == "paypal_webhook_invalid"
+
+
+def test_webhook_with_a_good_signature_records_the_capture_once(tmp_path):
+    import httpx
+
+    path = tmp_path / "workgraph.rl"
+    with connect(path) as conn:
+        seed(conn)
+        conn.flush()
+    paypal = PayPalClient(
+        "id",
+        "secret",
+        webhook_id="WH-1",
+        transport=httpx.MockTransport(_sandbox_handler([])),
+    )
+    app = create_app(path, paypal=paypal)
+    headers = {
+        "paypal-transmission-id": "t-1",
+        "paypal-transmission-time": "2026-11-13T00:00:00Z",
+        "paypal-cert-url": "https://api.paypal.com/cert",
+        "paypal-auth-algo": "SHA256withRSA",
+        "paypal-transmission-sig": "sig",
+    }
+    event = {
+        "event_type": "PAYMENT.CAPTURE.COMPLETED",
+        "resource": {
+            "id": "CAP-LIVE-1",
+            "supplementary_data": {"related_ids": {"order_id": "ORDER-LIVE-1"}},
+        },
+    }
+    with TestClient(app) as client:
+        client.post("/api/paypal/orders", json={"invoice_id": "inv-h2"})
+        first = client.post("/api/paypal/webhook", content=json.dumps(event), headers=headers)
+        assert first.status_code == 200
+        assert first.json()["already_captured"] is False
+        second = client.post("/api/paypal/webhook", content=json.dumps(event), headers=headers)
+        assert second.status_code == 200
+        assert second.json()["already_captured"] is True
+        project = client.get("/api/projects/proj-harbour").json()
+        assert len([item for item in project["payments"] if item["method"] == "paypal_sandbox"]) == 1
+
+
+def test_webhook_ignores_an_unknown_order_instead_of_404(tmp_path):
+    import httpx
+
+    path = tmp_path / "workgraph.rl"
+    with connect(path) as conn:
+        seed(conn)
+        conn.flush()
+    paypal = PayPalClient(
+        "id", "secret", webhook_id="WH-1", transport=httpx.MockTransport(_sandbox_handler([]))
+    )
+    app = create_app(path, paypal=paypal)
+    headers = {
+        "paypal-transmission-id": "t-1",
+        "paypal-transmission-time": "2026-11-13T00:00:00Z",
+        "paypal-cert-url": "https://api.paypal.com/cert",
+        "paypal-auth-algo": "SHA256withRSA",
+        "paypal-transmission-sig": "sig",
+    }
+    event = {
+        "event_type": "PAYMENT.CAPTURE.COMPLETED",
+        "resource": {
+            "id": "CAP-OTHER",
+            "supplementary_data": {"related_ids": {"order_id": "ORDER-OTHER"}},
+        },
+    }
+    with TestClient(app) as client:
+        response = client.post("/api/paypal/webhook", content=json.dumps(event), headers=headers)
+        assert response.status_code == 200
+        assert response.json()["ignored"] == "unknown_order"
+
+def test_capture_reads_a_completed_order_when_paypal_reports_a_conflict(tmp_path):
+    import httpx
+
+    records: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        records.append({"method": request.method, "path": request.url.path})
+        if request.url.path == "/v1/oauth2/token":
+            return httpx.Response(200, json={"access_token": "sandbox-token"})
+        if request.url.path == "/v2/checkout/orders":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "ORDER-LIVE-1",
+                    "status": "CREATED",
+                    "links": [{"rel": "approve", "href": "https://sandbox.paypal.example/approve"}],
+                },
+            )
+        if request.url.path.endswith("/capture"):
+            return httpx.Response(
+                422,
+                json={
+                    "name": "UNPROCESSABLE_ENTITY",
+                    "details": [{"issue": "ORDER_ALREADY_CAPTURED"}],
+                },
+            )
+        if request.url.path == "/v2/checkout/orders/ORDER-LIVE-1":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "ORDER-LIVE-1",
+                    "status": "COMPLETED",
+                    "purchase_units": [
+                        {
+                            "payments": {
+                                "captures": [
+                                    {
+                                        "id": "CAP-LIVE-1",
+                                        "status": "COMPLETED",
+                                        "amount": {"value": "2400.00", "currency_code": "USD"},
+                                    }
+                                ]
+                            }
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(404, json={"error": "not found"})
+
+    path = tmp_path / "workgraph.rl"
+    with connect(path) as conn:
+        seed(conn)
+        conn.flush()
+    paypal = PayPalClient("id", "secret", transport=httpx.MockTransport(handler))
+    app = create_app(path, paypal=paypal)
+    with TestClient(app) as client:
+        client.post("/api/paypal/orders", json={"invoice_id": "inv-h2"})
+        captured = client.post("/api/paypal/orders/ORDER-LIVE-1/capture")
+        assert captured.status_code == 200
+        assert captured.json()["payment"]["amount_cents"] == 240000
+        assert any(
+            record["method"] == "GET" and record["path"] == "/v2/checkout/orders/ORDER-LIVE-1"
+            for record in records
+        )
+        project = client.get("/api/projects/proj-harbour").json()
+        invoice = next(item for item in project["invoices"] if item["id"] == "inv-h2")
+        assert invoice["status"] == "PAID"

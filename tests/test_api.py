@@ -959,3 +959,70 @@ def test_capture_reads_a_completed_order_when_paypal_reports_a_conflict(tmp_path
         project = client.get("/api/projects/proj-harbour").json()
         invoice = next(item for item in project["invoices"] if item["id"] == "inv-h2")
         assert invoice["status"] == "PAID"
+
+def test_http_route_retries_an_empty_reasoning_completion_and_returns_citations(tmp_path):
+    import httpx
+
+    path = tmp_path / "workgraph.rl"
+    with connect(path) as conn:
+        seed(conn)
+        conn.flush()
+    app = create_app(path)
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        calls.append(body["model"])
+        if len(calls) == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "model": body["model"],
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": None, "reasoning": "thinking"},
+                            "finish_reason": "length",
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "model": body["model"],
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "Visible answer."},
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+        )
+
+    app.state.assistant = AssistantService(
+        api_key="test",
+        models=["a:free", "b:free"],
+        transport=httpx.MockTransport(handler),
+        retrieve=lambda question: app.state.graph.call(
+            lambda conn: retrieve_context(conn, question)
+        ),
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/assistant/chat/completions",
+            json={
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Which milestones are blocked until WG-1002 is paid?",
+                    }
+                ]
+            },
+        )
+    assert response.status_code == 200
+    assert calls == ["a:free", "b:free"]
+    assert "Visible answer." in response.text
+    assert "[ms-h3]" in response.text or "[inv-h2]" in response.text
+    assert response.headers["x-nsdeploy-llm-route"] == "live"

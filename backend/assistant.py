@@ -225,7 +225,7 @@ class AssistantService:
         with httpx.Client(transport=self.transport, timeout=45) as client:
             response = client.post(f"{OPENROUTER_BASE}/chat/completions", json=body, headers=headers)
         if response.status_code in (429,) or response.status_code >= 500:
-            raise _RetryModel()
+            raise _RetryModel("unavailable")
         if response.status_code in (401, 403):
             raise AssistantError(
                 "upstream_auth",
@@ -243,7 +243,15 @@ class AssistantService:
         except ValueError as exc:
             raise AssistantError("upstream_error", "The assistant provider returned invalid JSON.") from exc
         if not isinstance(data, dict) or not data.get("choices"):
-            raise AssistantError("upstream_error", "The assistant provider returned no choices.")
+            raise _RetryModel("empty")
+        choice = data["choices"][0] if isinstance(data["choices"], list) else {}
+        message = choice.get("message") if isinstance(choice, dict) else {}
+        if not isinstance(message, dict):
+            message = {}
+        tool_calls = message.get("tool_calls")
+        content = _message_text(message.get("content")).strip()
+        if not tool_calls and not content:
+            raise _RetryModel("empty")
         return data
 
     def chat(self, payload: dict, ip: str, day: str | None = None) -> dict:
@@ -315,13 +323,22 @@ class AssistantService:
             return _completion(ordered[0], reply.get("content") or "")
 
         upstream_messages = self._with_context(messages, bundle)
+        reasons: set[str] = set()
         for model in ordered:
             try:
                 data = self._upstream(model, upstream_messages, tools)
-            except _RetryModel:
+            except _RetryModel as exc:
+                reasons.add(exc.reason)
                 continue
             data.setdefault("model", model)
             return self._with_grounding(data, bundle)
+        if reasons == {"empty"}:
+            raise AssistantError(
+                "upstream_empty",
+                "Every free assistant model returned only reasoning tokens and no visible answer. "
+                "Try again shortly.",
+                502,
+            )
         raise AssistantError(
             "upstream_unavailable",
             "Every free assistant model is busy or unavailable. Try again shortly.",
@@ -384,4 +401,6 @@ class AssistantService:
 
 
 class _RetryModel(Exception):
-    pass
+    def __init__(self, reason: str = "unavailable"):
+        self.reason = reason
+        super().__init__(reason)

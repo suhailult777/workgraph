@@ -195,7 +195,7 @@ def load_nodes(conn) -> list[dict]:
         conn,
         "MATCH (n) RETURN labels(n)[0] AS kind, n.id AS id, n.name AS name, "
         "n.number AS number, n.status AS status, n.amount_cents AS amount_cents, "
-        "n.method AS method, n.invoice_id AS invoice_id",
+        "n.method AS method, n.invoice_id AS invoice_id, n.order AS sort_order",
     )
     nodes = []
     for row in result:
@@ -211,6 +211,7 @@ def load_nodes(conn) -> list[dict]:
             "amount_cents": row.get("amount_cents"),
             "method": row.get("method"),
             "invoice_id": row.get("invoice_id"),
+            "order": row.get("sort_order"),
         }
         if kind == "Payment" and not node["status"]:
             node["status"] = "PAID"
@@ -307,6 +308,133 @@ def _public(node: dict) -> dict:
     }
 
 
+def _is_blocked_invoice_question(question: str, terms: set[str]) -> bool:
+    lower = question.lower()
+    asks_invoice = bool(terms & {"invoice", "invoices", "payment", "unpaid", "outstanding"})
+    asks_blocked = bool(terms & {"blocked", "blocks", "blocking", "unpaid", "outstanding"})
+    return asks_invoice and (asks_blocked or "until" in lower)
+
+
+def _anchor_invoice(scored: list[tuple[dict, int]], question: str, terms: set[str]) -> dict | None:
+    invoices = [(node, score) for node, score in scored if node["kind"] == "Invoice"]
+    if not invoices:
+        return None
+    lower = question.lower()
+    for node, _ in invoices:
+        if node["id"].lower() in lower:
+            return node
+        number = str(node.get("number") or "").lower()
+        if number and number in lower:
+            return node
+    if _is_blocked_invoice_question(question, terms):
+        for node, _ in invoices:
+            if node.get("status") == "SENT":
+                return node
+        return invoices[0][0]
+    if invoices[0][1] >= 50:
+        return invoices[0][0]
+    return None
+
+
+def _project_scope(project: dict, edges: list[dict], by_id: dict[str, dict]) -> set[str]:
+    allowed = {
+        "Project": {"HAS_MILESTONE", "NEEDS_SKILL", "COMMISSIONED", "WORKED_ON"},
+        "Milestone": {"INVOICED", "PRODUCES", "DEPENDS_ON"},
+        "Invoice": {"PAID_BY"},
+        "Payment": {"UNLOCKS"},
+    }
+    adjacency: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for edge in edges:
+        adjacency[edge["source"]].append((edge["target"], edge["type"]))
+        adjacency[edge["target"]].append((edge["source"], edge["type"]))
+
+    scope = {project["id"]}
+    queue = [project["id"]]
+    while queue:
+        current_id = queue.pop(0)
+        current = by_id.get(current_id)
+        if current is None:
+            continue
+        edge_types = allowed.get(current["kind"])
+        if not edge_types:
+            continue
+        for neighbor_id, edge_type in adjacency.get(current_id, []):
+            if edge_type not in edge_types or neighbor_id in scope or neighbor_id not in by_id:
+                continue
+            scope.add(neighbor_id)
+            queue.append(neighbor_id)
+    return scope
+
+
+def _blocked_path(
+    by_id: dict[str, dict],
+    edges: list[dict],
+    invoice: dict,
+    limit: int = 12,
+) -> tuple[list[str], list[dict]]:
+    """Return invoice, its milestone, project and downstream blocked milestones."""
+    incoming: dict[str, list[dict]] = defaultdict(list)
+    for edge in edges:
+        incoming[edge["target"]].append(edge)
+
+    milestone = next(
+        (
+            by_id[edge["source"]]
+            for edge in incoming.get(invoice["id"], [])
+            if edge["type"] == "INVOICED" and edge["source"] in by_id
+        ),
+        None,
+    )
+    if milestone is None:
+        return [invoice["id"]], []
+
+    project = next(
+        (
+            by_id[edge["source"]]
+            for edge in incoming.get(milestone["id"], [])
+            if edge["type"] == "HAS_MILESTONE" and edge["source"] in by_id
+        ),
+        None,
+    )
+    dependents: dict[str, list[str]] = defaultdict(list)
+    for edge in edges:
+        if edge["type"] == "DEPENDS_ON":
+            dependents[edge["target"]].append(edge["source"])
+
+    blocked: list[dict] = []
+    visited = {milestone["id"]}
+    queue = [milestone["id"]]
+    while queue and len(blocked) < limit:
+        parent = queue.pop(0)
+        for child_id in dependents.get(parent, []):
+            if child_id in visited or child_id not in by_id:
+                continue
+            visited.add(child_id)
+            child = by_id[child_id]
+            blocked.append(child)
+            queue.append(child_id)
+
+    blocked.sort(
+        key=lambda node: (
+            node.get("order") if node.get("order") is not None else 9999,
+            node["title"].lower(),
+        )
+    )
+    path_nodes = [invoice, milestone]
+    if project is not None:
+        path_nodes.append(project)
+    path_nodes.extend(blocked)
+
+    path_ids = [node["id"] for node in path_nodes]
+    path_set = set(path_ids)
+    path_edges = [
+        edge
+        for edge in edges
+        if edge["source"] in path_set and edge["target"] in path_set
+    ]
+    return path_ids, path_edges
+
+
 def retrieve_context(conn, question: str, limit: int = 8) -> dict:
     """Return the most relevant nodes, their connecting edges and a prompt block."""
     question = (question or "").strip()
@@ -317,9 +445,29 @@ def retrieve_context(conn, question: str, limit: int = 8) -> dict:
     scored = [(node, _score(node, question.lower(), terms)) for node in nodes]
     scored = [(node, score) for node, score in scored if score >= 3]
     scored.sort(key=lambda item: (-item[1], item[0]["kind"], item[0]["title"].lower()))
-    top = [node for node, _ in scored[:limit]]
 
-    if not top:
+    anchor = _anchor_invoice(scored, question, terms)
+    path_ids: list[str] = []
+    path_edges: list[dict] = []
+    if anchor is not None:
+        path_ids, path_edges = _blocked_path(by_id, edges, anchor)
+
+    candidates = scored
+    if anchor is not None:
+        path_set = set(path_ids)
+        project = next(
+            (by_id[node_id] for node_id in path_ids if by_id[node_id]["kind"] == "Project"),
+            None,
+        )
+        scope = _project_scope(project, edges, by_id) if project is not None else set()
+        candidates = [
+            (node, score)
+            for node, score in scored
+            if node["id"] in path_set or node["id"] in scope or score >= 50
+        ]
+    top = [node for node, _ in candidates[:limit]]
+
+    if not top and not path_ids:
         return {
             "matched": [],
             "nodes": [],
@@ -333,11 +481,20 @@ def retrieve_context(conn, question: str, limit: int = 8) -> dict:
         adjacency[edge["source"]].append(edge["target"])
         adjacency[edge["target"]].append(edge["source"])
 
-    selected = {node["id"]: node for node in top}
-    max_nodes = min(16, max(limit + 4, limit))
-    frontier = top[:3]
+    max_nodes = min(24, max(limit + 12, 16))
+    selected: dict[str, dict] = {}
+    for node_id in path_ids:
+        if node_id in by_id:
+            selected[node_id] = by_id[node_id]
+    for node in top:
+        if len(selected) >= max_nodes:
+            break
+        selected.setdefault(node["id"], node)
+
+    frontier: list[dict] = [by_id[node_id] for node_id in path_ids if node_id in by_id]
+    frontier.extend(top[:3])
     for _ in range(2):
-        next_frontier = []
+        next_frontier: list[dict] = []
         for node in frontier:
             for neighbor_id in adjacency.get(node["id"], []):
                 if len(selected) >= max_nodes:
@@ -355,15 +512,38 @@ def retrieve_context(conn, question: str, limit: int = 8) -> dict:
         for edge in edges
         if edge["source"] in selected and edge["target"] in selected
     ]
-    selected_edges.sort(key=lambda edge: (edge["source"], edge["type"], edge["target"]))
+    path_edge_keys = {(edge["source"], edge["type"], edge["target"]) for edge in path_edges}
+    selected_edges.sort(
+        key=lambda edge: (
+            0 if (edge["source"], edge["type"], edge["target"]) in path_edge_keys else 1,
+            edge["source"],
+            edge["type"],
+            edge["target"],
+        )
+    )
 
-    ordered = sorted(
-        selected.values(),
-        key=lambda node: (
-            0 if node["id"] in {item["id"] for item in top} else 1,
-            node["kind"],
-            node["title"].lower(),
-        ),
+    matched_nodes: list[dict] = []
+    seen_matched: set[str] = set()
+    for node_id in path_ids:
+        node = by_id.get(node_id)
+        if node is not None and node_id not in seen_matched:
+            seen_matched.add(node_id)
+            matched_nodes.append(node)
+    for node in top:
+        if node["id"] in seen_matched:
+            continue
+        if len(matched_nodes) >= max(limit, 10):
+            break
+        seen_matched.add(node["id"])
+        matched_nodes.append(node)
+
+    ordered = [by_id[node_id] for node_id in path_ids if node_id in by_id]
+    ordered_ids = {node["id"] for node in ordered}
+    ordered.extend(
+        sorted(
+            (node for node in selected.values() if node["id"] not in ordered_ids),
+            key=lambda node: (node["kind"], node["title"].lower()),
+        )
     )
     lines = [
         "Graph context for WorkGraph sample data. Amounts are integer cents.",
@@ -386,7 +566,7 @@ def retrieve_context(conn, question: str, limit: int = 8) -> dict:
         ]
     )
     return {
-        "matched": [_public(node) for node in top],
+        "matched": [_public(node) for node in matched_nodes],
         "nodes": [_public(node) for node in ordered],
         "edges": selected_edges,
         "terms": sorted(terms),
@@ -433,5 +613,5 @@ def citations_for(answer: str, bundle: dict) -> list[dict]:
 def source_line(bundle: dict, citations: list[dict] | None = None) -> str:
     """Compact source line for an answer that forgot to cite its nodes."""
     items = citations or (bundle.get("matched") or [])
-    parts = [f'[{node["id"]}] "{node["title"]}"' for node in items[:4]]
+    parts = [f'[{node["id"]}] "{node["title"]}"' for node in items[:6]]
     return "Sources: " + "; ".join(parts) if parts else ""

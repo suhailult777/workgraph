@@ -240,3 +240,129 @@ def test_a_retrieval_failure_refuses_to_answer_without_sources():
         )
     assert error.value.code == "graph_unavailable"
     assert error.value.status == 503
+
+def test_empty_content_is_retried_on_the_next_free_model():
+    records: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        records.append(body["model"])
+        if body["model"] == "a:free":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "empty-1",
+                    "model": body["model"],
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "reasoning": "only reasoning tokens",
+                            },
+                            "finish_reason": "length",
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "visible-1",
+                "model": body["model"],
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "Visible answer."},
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+        )
+
+    service = AssistantService(
+        api_key="test",
+        models=["a:free", "b:free"],
+        transport=httpx.MockTransport(handler),
+        quota=lambda ip, day, ip_cap, global_cap: {"allowed": True},
+    )
+    completion = service.chat(
+        {"messages": [{"role": "user", "content": "Which milestone is blocked?"}]},
+        "127.0.0.1",
+    )
+    assert records == ["a:free", "b:free"]
+    assert completion["model"] == "b:free"
+    assert completion["choices"][0]["message"]["content"] == "Visible answer."
+
+
+def test_all_empty_content_reports_an_empty_upstream_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "model": body["model"],
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "", "reasoning": "thinking"},
+                        "finish_reason": "length",
+                    }
+                ],
+            },
+        )
+
+    service = AssistantService(
+        api_key="test",
+        models=["a:free", "b:free"],
+        transport=httpx.MockTransport(handler),
+        quota=lambda ip, day, ip_cap, global_cap: {"allowed": True},
+    )
+    with pytest.raises(AssistantError) as error:
+        service.chat(
+            {"messages": [{"role": "user", "content": "Which milestone is blocked?"}]},
+            "127.0.0.1",
+        )
+    assert error.value.code == "upstream_empty"
+    assert error.value.status == 502
+
+
+def test_a_tool_call_with_empty_content_is_not_retried():
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "model": body["model"],
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call-1",
+                                    "type": "function",
+                                    "function": {"name": "website_get_graph_state", "arguments": "{}"},
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+            },
+        )
+
+    service = AssistantService(
+        api_key="test",
+        models=["a:free", "b:free"],
+        transport=httpx.MockTransport(handler),
+        quota=lambda ip, day, ip_cap, global_cap: {"allowed": True},
+    )
+    completion = service.chat(
+        {"messages": [{"role": "user", "content": "Read the graph."}]},
+        "127.0.0.1",
+    )
+    assert completion["choices"][0]["message"]["tool_calls"][0]["id"] == "call-1"

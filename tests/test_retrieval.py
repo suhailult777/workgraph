@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from graph.db import connect
+from graph.operations import create_sample_project
 from graph.retrieval import citations_for, retrieve_context, source_line
 from graph.seed import seed
 
@@ -75,5 +76,31 @@ def test_context_is_bounded(tmp_path):
         bundle = retrieve_context(conn, "Show every project milestone invoice payment skill", limit=3)
         assert len(bundle["nodes"]) <= 16
         assert bundle["context"].count("amount_cents") <= 16
+    finally:
+        conn.close()
+
+def test_blocked_invoice_path_survives_extra_invoices(tmp_path):
+    conn = build_store(tmp_path)
+    try:
+        for index in range(10):
+            create_sample_project(conn, f"Noise project {index}")
+        conn.flush()
+
+        bundle = retrieve_context(
+            conn,
+            "Which Harbour rebrand milestones are blocked until invoice WG-1002 is paid?",
+        )
+        ids = {node["id"] for node in bundle["nodes"]}
+        assert {"inv-h2", "ms-h2", "ms-h3", "ms-h4", "proj-harbour"} <= ids
+        assert "[ms-h3]" in bundle["context"]
+        assert "[ms-h4]" in bundle["context"]
+        assert "[inv-h2]" in bundle["context"]
+        edges = {(edge["source"], edge["type"], edge["target"]) for edge in bundle["edges"]}
+        assert ("ms-h2", "INVOICED", "inv-h2") in edges
+        assert ("ms-h3", "DEPENDS_ON", "ms-h2") in edges
+        assert ("ms-h4", "DEPENDS_ON", "ms-h3") in edges
+        matched_ids = {node["id"] for node in bundle["matched"]}
+        assert {"inv-h2", "ms-h3", "ms-h4"} <= matched_ids
+        assert "[ms-h4]" in source_line(bundle)
     finally:
         conn.close()

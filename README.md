@@ -4,11 +4,12 @@ WorkGraph is a new open agentic website for freelance work: projects, milestone
 dependencies, invoices and sample payments live in a persistent Relate graph.
 People and browser agents read and change the same graph.
 
-**Status: Phase 1, milestone 5 (15 Nov 2026).** Local checks pass. Nothing was
+**Status: Phase 1, milestone 6 (15 Nov 2026).** Local checks pass. Nothing was
 pushed or deployed by this task. The human UI, graph operations, browser
-assistant, live server assistant with graph retrieval and citations, sandbox
-PayPal checkout with a return-to-app capture, webhook signature verification and
-the durable Blob snapshot path are in place. Production refuses demo mode.
+assistant, live server assistant with cited retrieval and empty-completion
+retry, sandbox PayPal checkout with a return-to-app capture, webhook signature
+verification and the durable Blob snapshot path are in place. Production
+refuses demo mode.
 
 ## What is here
 
@@ -17,7 +18,7 @@ the durable Blob snapshot path are in place. Production refuses demo mode.
 | `backend/app.py` | FastAPI: health, config, projects, payments, milestones, assistant, PayPal sandbox, artifacts, React build |
 | `backend/assistant.py` | Server-side OpenRouter free-model proxy with per-IP and global daily caps, graph context and citation checks |
 | `backend/paypal.py` | PayPal Orders v2 sandbox client, capture verification, idempotent claims and webhook signature check |
-| `graph/retrieval.py` | Scores graph nodes against a question, expands one hop and builds the cited context block |
+| `graph/retrieval.py` | Scores graph nodes, follows an invoice to its milestone, project and blocked dependents, then builds the cited context block |
 | `backend/storage.py` | Local file or Vercel Blob snapshot with ETag compare-and-swap |
 | `vercel.json` | Vercel build, Python function, static public artifacts and CORS headers |
 | `pyproject.toml` | Vercel FastAPI entrypoint and static CDN settings |
@@ -125,14 +126,16 @@ API as the page.
   email or call live PayPal.
 - **Grounding:** the server retrieves the matching nodes and edges from Relate
   for the question, inserts that context as a system message, and checks the
-  reply for node ids or titles. If the model omits sources, the server appends a
-  short `Sources:` line from the retrieved nodes. A question with no matching
-  node returns `not in the graph` without calling the provider.
+  reply for node ids or titles. If the best match is an invoice, the retriever
+  reserves the invoice, its milestone, the project and every milestone blocked
+  downstream before it adds weaker matches. If the model omits sources, the
+  server appends a short `Sources:` line. A question with no matching node
+  returns `not in the graph` without calling the provider.
 - **Live mode:** when `/api/config` reports `assistant_live: true`, the browser
   boots the runtime against `/api/assistant`. The server calls OpenRouter with
   an allowlist of model ids ending in `:free`, falls back to the next free model
-  on 429/5xx, and enforces per-IP and global daily caps. The key stays on the
-  server.
+  on 429/5xx or an empty reasoning-only completion, and enforces per-IP and
+  global daily caps. The key stays on the server.
 - **Local demo:** with `WORKGRAPH_ASSISTANT_MOCK=1` on a development host, the
   same server endpoint uses the deterministic scripted model. The panel labels
   it `DEV` / `Local demo`. Production never selects it.
@@ -406,6 +409,7 @@ Result: `Build` and `Handover` both wait on `Design system` (invoice `WG-1002`,
 - [`docs/shots/p1m5-sandbox-order.png`](docs/shots/p1m5-sandbox-order.png): labelled mock PayPal sandbox order ready for approval.
 - [`docs/shots/p1m5-payment-paid.png`](docs/shots/p1m5-payment-paid.png): paid project after the return capture, with the PayPal sandbox payment in the ledger.
 - [`docs/shots/p1m5-assistant-citations.png`](docs/shots/p1m5-assistant-citations.png): grounded assistant answer with node ids.
+- [`docs/shots/p1m6-grounded-answer.png`](docs/shots/p1m6-grounded-answer.png): live free-model answer citing `ms-h3`, `ms-h4`, `inv-h2` and `WG-1002`.
 
 ## Limits
 
